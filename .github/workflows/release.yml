@@ -51,7 +51,7 @@ jobs:
           git tag -f "${{ steps.tag.outputs.tag }}" HEAD
           git push origin HEAD:main
           git push origin "${{ steps.tag.outputs.tag }}" --force
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - run: cargo build --release
       - run: cargo test
       # Publishing MUST use crates.io trusted publishing (OIDC).
