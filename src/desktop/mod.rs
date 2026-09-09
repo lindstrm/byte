@@ -5,3 +5,4 @@
 pub mod journal;
 pub mod paths;
 pub mod profile;
+pub mod swap;
