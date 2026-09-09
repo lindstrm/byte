@@ -29,6 +29,27 @@ pub trait HostPaths: Send + Sync {
     fn accounts_file(&self) -> PathBuf {
         self.byte_config_dir().join("accounts.json")
     }
+
+    /// Where parked desktop profiles are stored, one directory per account.
+    ///
+    /// byte's own state, not the app's, so it sits beside `accounts.json`
+    /// rather than inside `%APPDATA%\Claude`. Note that unlike everything
+    /// else byte stores, its contents are live session credentials as plain
+    /// files -- see §6 of the desktop-switching design for why the keychain
+    /// cannot hold them.
+    fn desktop_store_dir(&self) -> PathBuf {
+        self.byte_config_dir().join("desktop")
+    }
+
+    /// The in-progress swap journal. Present only mid-swap.
+    fn desktop_journal_file(&self) -> PathBuf {
+        self.desktop_store_dir().join("journal.json")
+    }
+
+    /// One account's parked profile.
+    fn desktop_profile_dir(&self, account_uuid: &str) -> PathBuf {
+        self.desktop_store_dir().join(account_uuid)
+    }
 }
 
 /// Lets `&TestPaths` and `&RealPaths` satisfy `HostPaths`, so callers can hold
