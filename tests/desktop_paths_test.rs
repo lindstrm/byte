@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use byte::desktop::paths::{DesktopPaths, RealDesktopPaths, TestDesktopPaths};
 use byte::paths::{HostPaths, TestPaths};
@@ -8,18 +8,21 @@ use byte::paths::{HostPaths, TestPaths};
 fn the_default_location_is_under_appdata() {
     // Mirrors RealPaths::resolve: pure path arithmetic, so the mapping is
     // testable without touching process-global environment variables.
-    let p = RealDesktopPaths::resolve(Path::new(r"C:\Users\x\AppData\Roaming"), None);
-    assert_eq!(
-        p.desktop_dir(),
-        PathBuf::from(r"C:\Users\x\AppData\Roaming\Claude")
-    );
+    // Uses forward slashes to work cross-platform; Path::PartialEq compares
+    // components, and backslashes are literal characters on non-Windows.
+    let appdata = Path::new("C:/Users/x/AppData/Roaming");
+    let p = RealDesktopPaths::resolve(appdata, None);
+    assert_eq!(p.desktop_dir(), appdata.join("Claude"));
 }
 
 #[test]
 fn the_override_replaces_the_whole_directory() {
-    let over = OsString::from(r"D:\elsewhere\Claude");
-    let p = RealDesktopPaths::resolve(Path::new(r"C:\Users\x\AppData\Roaming"), Some(&over));
-    assert_eq!(p.desktop_dir(), PathBuf::from(r"D:\elsewhere\Claude"));
+    // When an override is provided, it replaces the whole directory path,
+    // not appended to appdata. Uses forward slashes for cross-platform
+    // component compatibility.
+    let over = OsString::from("D:/elsewhere/Claude");
+    let p = RealDesktopPaths::resolve(Path::new("C:/Users/x/AppData/Roaming"), Some(&over));
+    assert_eq!(p.desktop_dir(), Path::new("D:/elsewhere/Claude"));
 }
 
 #[test]
