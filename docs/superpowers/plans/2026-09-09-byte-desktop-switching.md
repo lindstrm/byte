@@ -1945,6 +1945,77 @@ fn the_outgoing_accounts_oauth_is_parked_with_its_profile() {
 
 Run it, then temporarily move the capture block below `swap::execute` and confirm it fails. Restore.
 
+- [ ] **Step 3c: Stamp the parked profile into accounts.json**
+
+The `desktop_profile` record from Task 7 is written here — it is what makes `byte list` able to answer "which accounts have a stored desktop session, and what is it costing me in disk". Without this step the field is dead weight.
+
+After `swap::execute` succeeds, and only when a profile was parked:
+
+```rust
+/// Total size of a directory tree, for the stored-profile record.
+///
+/// Best-effort: an unreadable entry contributes zero rather than failing the
+/// switch. This number is for display, and a switch that already committed
+/// must never be turned into an `Err` by a reporting detail.
+fn dir_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
+            Err(_) => 0,
+        })
+        .sum()
+}
+```
+
+and in `switch_desktop`, after the swap:
+
+```rust
+    if let (Some(uuid), Some(park_to)) = (outgoing, park_to.as_deref()) {
+        let mut accounts = AccountsFile::load(&paths.accounts_file())?;
+        if let Ok(meta) = accounts.resolve_mut(uuid) {
+            meta.desktop_profile = Some(DesktopProfileRecord {
+                captured_at: crate::store::metadata::now_rfc3339(),
+                bytes: dir_size(park_to),
+            });
+            accounts.save(&paths.accounts_file(), &paths.backup_dir())?;
+        }
+    }
+```
+
+Use whatever timestamp helper `metadata.rs` already uses for `added_at` rather than introducing a second one — read the file and match it.
+
+Add to `tests/ops_desktop_test.rs`:
+
+```rust
+#[test]
+fn parking_a_profile_records_it_against_the_account() {
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live(&dp, "account-a");
+    // An accounts.json holding the outgoing account must exist for the
+    // record to land on.
+    let mut accounts = byte::store::metadata::AccountsFile::default();
+    accounts.upsert_from("a", &sample_snapshot("a"));
+    accounts
+        .save(&tp.accounts_file(), &tp.backup_dir())
+        .unwrap();
+
+    switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b").unwrap();
+
+    let back = byte::store::metadata::AccountsFile::load(&tp.accounts_file()).unwrap();
+    let rec = back.resolve("a").unwrap().desktop_profile.clone().unwrap();
+    assert!(rec.bytes > 0, "a parked profile with files in it must record a nonzero size");
+    assert!(!rec.captured_at.is_empty());
+}
+```
+
+Write `sample_snapshot` as a local helper mirroring `snap` in `tests/metadata_test.rs`.
+
 - [ ] **Step 4: Declare it**
 
 In `src/ops/mod.rs`, add `pub mod desktop;`.
@@ -1975,28 +2046,80 @@ git commit -m "feat(ops): switch the desktop session alongside Claude Code"
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `tests/cli_test.rs`. The `byte()` helper must gain `CLAUDE_DESKTOP_DIR` pointing into the same tempdir, so the compiled binary can never reach a real `%APPDATA%\Claude`:
+First extend the `byte()` helper in `tests/cli_test.rs` to set `CLAUDE_DESKTOP_DIR` to `tp.root().join("desktop")`, so the compiled binary can never reach a real `%APPDATA%\Claude`:
+
+```rust
+        .env("CLAUDE_DESKTOP_DIR", tp.root().join("desktop"))
+```
+
+Then append this test:
 
 ```rust
 #[test]
-fn switch_reports_when_the_desktop_app_was_left_alone() {
-    // Windows-only behaviour, but the message path is worth pinning
-    // everywhere the binary builds.
+fn any_command_repairs_an_interrupted_desktop_swap() {
+    // Uses `list`, deliberately, for two reasons. First, the requirement is
+    // that the journal is repaired by whatever byte command runs NEXT --
+    // not only by a retry of `switch` -- and nothing else in this plan
+    // tests that. Second, `list` is keychain-free: a SUCCESSFUL `switch`
+    // through the compiled binary reaches secrets.get(), which for this
+    // binary is the REAL OS keychain. That is why this suite only ever
+    // runs `switch <unknown-name>`, which fails at resolution first.
     let tp = TestPaths::new().unwrap();
     seed_one_account(&tp);
-    let out = byte(&tp, &["switch", "work", "--json"]);
-    // Whatever the desktop half does, --json stdout stays parseable.
-    if out.status.success() {
-        let _: serde_json::Value = serde_json::from_slice(&out.stdout)
-            .expect("switch --json must emit valid JSON on stdout");
-    }
+
+    let live = tp.root().join("desktop");
+    std::fs::create_dir_all(&live).unwrap();
+
+    // A half-completed park: the directory is already in the store, and the
+    // journal records that one move as done.
+    let parked = tp.desktop_profile_dir("u1").join("Network");
+    std::fs::create_dir_all(&parked).unwrap();
+    std::fs::write(parked.join("marker.txt"), "account-1").unwrap();
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(
+        tp.desktop_journal_file(),
+        serde_json::json!({
+            "version": 1,
+            "outgoing": "u1",
+            "incoming": null,
+            "moves": [{
+                "stage": "Park",
+                "from": live.join("Network"),
+                "to": parked,
+                "done": true
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = byte(&tp, &["list"]);
+
+    assert!(
+        out.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        live.join("Network").join("marker.txt").exists(),
+        "no install move completed, so the park must be reversed and the session restored"
+    );
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "the journal must be cleared once repaired, or every later command repeats the repair"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("repaired"),
+        "a silent repair is indistinguishable from nothing having happened: {stderr}"
+    );
 }
 ```
 
-- [ ] **Step 2: Run it and confirm the current behaviour**
+- [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --test cli_test`
-Expected: PASS already (the assertion is about not regressing). Record the baseline.
+Run: `cargo test --test cli_test any_command_repairs`
+Expected: FAIL — the journal is left in place and the directory is not restored, because nothing checks for a journal yet.
 
 - [ ] **Step 3: Add the journal check to every command**
 
@@ -2033,6 +2156,29 @@ After the Claude Code switch has committed and its result is rendered, and only 
 ```
 
 Note: a `switch_desktop` failure must NOT turn an already-committed Claude Code switch into an `Err`. Catch it, report it through `output::warn`, and keep the overall command successful — this is the same "never fail an operation that already succeeded" rule that `notify::send` and `atomic::prune` follow. Add a test that a failing desktop half still exits zero.
+
+- [ ] **Step 4b: Surface stored profiles in `byte list`**
+
+This is what the `desktop_profile` record exists for. In `cmd_list`'s human-readable output, mark accounts with a stored desktop session and its size; in `--json`, include the record as a `desktop_profile` object (or `null`).
+
+Add to `tests/cli_test.rs`, which is keychain-free because `list` only reads `accounts.json`:
+
+```rust
+#[test]
+fn list_json_reports_a_stored_desktop_profile() {
+    let tp = TestPaths::new().unwrap();
+    seed_one_account(&tp);
+
+    let before = byte(&tp, &["list", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert!(
+        parsed[0]["desktop_profile"].is_null(),
+        "an account with no stored profile must report null, not omit the field: {parsed}"
+    );
+}
+```
+
+Pair it with a case that seeds a record and asserts the size is reported, so a `null`-always implementation fails.
 
 - [ ] **Step 5: Full check and commit**
 
