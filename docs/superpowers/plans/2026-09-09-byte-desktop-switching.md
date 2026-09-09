@@ -635,11 +635,22 @@ fn every_park_precedes_every_install() {
     seed(&take, &["Network", "Local Storage"]);
 
     let j = Journal::plan(&live, Some(&park), Some(&take)).unwrap();
-    let first_install = j.moves.iter().position(|m| m.stage == Stage::Install).unwrap();
+    let stages: Vec<Stage> = j.moves.iter().map(|m| m.stage).collect();
+    let first_install = stages.iter().position(|s| *s == Stage::Install).unwrap();
+
+    // Both assertions are needed, and the first one is the point. A prefix
+    // form -- "everything before the first install is a park" -- is
+    // VACUOUSLY TRUE when the loops are swapped: first_install would be 0,
+    // moves[..0] is empty, and .all() on an empty iterator returns true. It
+    // would pass against the exact bug this test is named for. Do not
+    // simplify it back.
     assert!(
-        j.moves[..first_install].iter().all(|m| m.stage == Stage::Park),
-        "parks and installs are interleaved: {:?}",
-        j.moves
+        first_install > 0,
+        "at least one park must precede the first install: {stages:?}"
+    );
+    assert!(
+        stages[first_install..].iter().all(|s| *s == Stage::Install),
+        "no park may follow an install: {stages:?}"
     );
 }
 
