@@ -47,11 +47,24 @@ fn every_park_precedes_every_install() {
         .iter()
         .position(|m| m.stage == Stage::Install)
         .unwrap();
+
+    // Assert at least one park exists before any install (first_install > 0).
+    // If the park loop were swapped before the install loop, first_install would be 0,
+    // and the original prefix-slice form (j.moves[..0].all(...)) would vacuously pass
+    // because .all() on an empty iterator returns true. This assertion catches that bug.
     assert!(
-        j.moves[..first_install]
+        first_install > 0,
+        "at least one park must precede the first install: {:?}",
+        j.moves
+    );
+
+    // Assert every move from the first install onward is an install.
+    // This catches any interleaving of parks and installs after the first install.
+    assert!(
+        j.moves[first_install..]
             .iter()
-            .all(|m| m.stage == Stage::Park),
-        "parks and installs are interleaved: {:?}",
+            .all(|m| m.stage == Stage::Install),
+        "all moves after the first install must be installs, not interleaved: {:?}",
         j.moves
     );
 }
