@@ -89,8 +89,85 @@ fn clear_journal(paths: &impl HostPaths) -> Result<()> {
     }
 }
 
+/// Which way a move is currently being applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// `from` -> `to`; mark the move done on success.
+    Forward,
+    /// `to` -> `from`; mark the move NOT done on success.
+    Backward,
+}
+
+/// Apply one move in the given direction, then flip `done` and persist.
+///
+/// `execute`, RollForward, and Reverse recovery all follow the same shape:
+/// rename, flip `done`, persist -- and a process killed between the rename
+/// succeeding and that persist landing leaves the directory already moved
+/// on disk while the journal still disagrees. Left alone, the next attempt
+/// to apply this same move re-runs the identical rename and finds its
+/// source already gone.
+///
+/// So the physical source/destination pair for this move and direction is
+/// classified before renaming:
+/// - the source still holds the directory -> rename normally.
+/// - the source is empty and the destination already holds the directory ->
+///   an earlier crash landed in this exact window; the rename already
+///   happened and only the journal write recording it did not. Treat it as
+///   a no-op success rather than failing on a source that predictably no
+///   longer exists.
+/// - neither holds it -> genuinely wrong; fall through to the normal
+///   rename, which fails with the OS's own error naming the missing
+///   source. That failure is not papered over.
+fn apply_move(
+    paths: &impl HostPaths,
+    journal: &mut Journal,
+    index: usize,
+    direction: Direction,
+) -> Result<()> {
+    let (source, dest) = {
+        let m = &journal.moves[index];
+        match direction {
+            Direction::Forward => (m.from.clone(), m.to.clone()),
+            Direction::Backward => (m.to.clone(), m.from.clone()),
+        }
+    };
+
+    let already_applied = !source.exists() && dest.exists();
+    if !already_applied {
+        rename(&source, &dest)?;
+    }
+
+    match direction {
+        Direction::Forward => journal.mark_done(index),
+        Direction::Backward => journal.moves[index].done = false,
+    }
+    write_journal(paths, journal)
+}
+
 /// Run a planned swap, recording progress as it goes.
+///
+/// Precondition: no journal file may already exist at
+/// `paths.desktop_journal_file()`. `recover_if_interrupted` runs at the
+/// start of every byte command specifically so that precondition holds by
+/// the time any command plans a new swap and calls this function --
+/// starting a new plan on top of an unrepaired one would overwrite the only
+/// record of it while its `from` paths may already have moved. `execute`
+/// enforces the precondition itself, refusing to start, rather than
+/// trusting every future caller to have run recovery first.
 pub fn execute(paths: &impl HostPaths, mut journal: Journal) -> Result<()> {
+    let file = paths.desktop_journal_file();
+    if file.exists() {
+        return Err(Error::DesktopSwapInterrupted {
+            journal: file,
+            detail: "An earlier swap left this journal behind and it was never repaired. \
+                     byte will not start a new swap over it, since that would destroy the \
+                     only record of the old one while its files may already be half-moved. \
+                     Run any byte command first -- recovery runs automatically at the start \
+                     of every command -- then retry."
+                .to_string(),
+        });
+    }
+
     if journal.moves.is_empty() {
         return Ok(());
     }
@@ -101,13 +178,10 @@ pub fn execute(paths: &impl HostPaths, mut journal: Journal) -> Result<()> {
     write_journal(paths, &journal)?;
 
     for index in 0..journal.moves.len() {
-        let (from, to) = {
-            let m = &journal.moves[index];
-            (m.from.clone(), m.to.clone())
-        };
-        rename(&from, &to)?;
-        journal.mark_done(index);
-        write_journal(paths, &journal)?;
+        if journal.moves[index].done {
+            continue;
+        }
+        apply_move(paths, &mut journal, index, Direction::Forward)?;
     }
 
     clear_journal(paths)
@@ -146,38 +220,28 @@ pub fn recover_if_interrupted(paths: &impl HostPaths) -> Result<Option<Recovery>
         });
     }
 
+    let mut journal = journal;
     let recovery = recovery_for(&journal);
     match recovery {
         Recovery::RollForward => {
-            let mut journal = journal;
             for index in 0..journal.moves.len() {
                 if journal.moves[index].done {
                     continue;
                 }
-                let (from, to) = {
-                    let m = &journal.moves[index];
-                    (m.from.clone(), m.to.clone())
-                };
-                rename(&from, &to)?;
-                journal.mark_done(index);
-                write_journal(paths, &journal)?;
+                apply_move(paths, &mut journal, index, Direction::Forward)?;
             }
         }
         Recovery::Reverse => {
             // Reverse order, so a directory is never restored on top of one
-            // still waiting to be moved out of the way.
-            let mut journal = journal;
+            // still waiting to be moved out of the way. Every index is
+            // visited, not just those marked `done`: a move whose rename
+            // already happened before a crash but whose `done` flag never
+            // persisted must still be reversed, or its directory is
+            // stranded -- `apply_move`'s own classification (not the stale
+            // `done` flag) is what decides whether there is anything left
+            // to do.
             for index in (0..journal.moves.len()).rev() {
-                if !journal.moves[index].done {
-                    continue;
-                }
-                let (from, to) = {
-                    let m = &journal.moves[index];
-                    (m.from.clone(), m.to.clone())
-                };
-                rename(&to, &from)?;
-                journal.moves[index].done = false;
-                write_journal(paths, &journal)?;
+                apply_move(paths, &mut journal, index, Direction::Backward)?;
             }
         }
     }
