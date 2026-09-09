@@ -70,18 +70,25 @@ use byte::paths::{HostPaths, TestPaths};
 fn the_default_location_is_under_appdata() {
     // Mirrors RealPaths::resolve: pure path arithmetic, so the mapping is
     // testable without touching process-global environment variables.
-    let p = RealDesktopPaths::resolve(Path::new(r"C:\Users\x\AppData\Roaming"), None);
-    assert_eq!(
-        p.desktop_dir(),
-        PathBuf::from(r"C:\Users\x\AppData\Roaming\Claude")
-    );
+    //
+    // Forward slashes ONLY, and the expectation built with join rather than
+    // a second literal. Path PartialEq compares components, and a backslash
+    // is an ordinary character on Linux and macOS -- so a backslash literal
+    // would be one component there while the joined value is two, failing
+    // deterministically on two of CI three platforms. tests/paths_test.rs
+    // solves the same hazard the same way.
+    let appdata = Path::new("C:/Users/x/AppData/Roaming");
+    let p = RealDesktopPaths::resolve(appdata, None);
+    assert_eq!(p.desktop_dir(), appdata.join("Claude"));
 }
 
 #[test]
 fn the_override_replaces_the_whole_directory() {
-    let over = OsString::from(r"D:\elsewhere\Claude");
-    let p = RealDesktopPaths::resolve(Path::new(r"C:\Users\x\AppData\Roaming"), Some(&over));
-    assert_eq!(p.desktop_dir(), PathBuf::from(r"D:\elsewhere\Claude"));
+    // An independent literal here, deliberately: this must fail if resolve
+    // ignored the override or appended it to appdata.
+    let over = OsString::from("D:/elsewhere/Claude");
+    let p = RealDesktopPaths::resolve(Path::new("C:/Users/x/AppData/Roaming"), Some(&over));
+    assert_eq!(p.desktop_dir(), Path::new("D:/elsewhere/Claude"));
 }
 
 #[test]
