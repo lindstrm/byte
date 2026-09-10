@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use byte::paths::{HostPaths, RealPaths, TestPaths};
+use byte::paths::{HostPaths, RealPaths, TestPaths, is_profile_store_component};
 
 // Finding I7: RealPaths::discover() -- the function that decides which
 // files byte reads and writes -- had zero direct test coverage. These drive
@@ -124,5 +124,67 @@ fn accounts_file_lives_in_the_config_dir() {
     assert_eq!(
         tp.accounts_file(),
         tp.byte_config_dir().join("accounts.json")
+    );
+}
+
+#[test]
+fn an_ordinary_account_identifier_names_a_profile_directory() {
+    // byte treats account identifiers as opaque strings, so the check is on
+    // shape only: a real uuid, and anything else that is a single, ordinary
+    // entry name, has to pass.
+    for name in [
+        "0a1b2c3d-4e5f-6789-abcd-ef0123456789",
+        "u1",
+        "a.b",
+        "with space",
+        "..leading-dots",
+        "Ünïcodé",
+    ] {
+        assert!(is_profile_store_component(name), "{name} should be usable");
+    }
+}
+
+#[test]
+fn a_traversing_or_rooted_identifier_cannot_name_a_profile_directory() {
+    // `desktop_profile_dir` joins this straight onto the store path, and
+    // `Path::join` is not a string append: an absolute component replaces the
+    // base outright, a separator nests, and `..` walks up -- redirecting the
+    // park, the journal's recorded `to` paths, and `manage::remove`'s
+    // recursive delete along with it.
+    for name in [
+        "",
+        ".",
+        "..",
+        "../escape",
+        "..\\escape",
+        "a/b",
+        "a\\b",
+        "/etc/passwd",
+        "C:\\Windows",
+        "C:",
+        "with\0nul",
+    ] {
+        assert!(
+            !is_profile_store_component(name),
+            "{name:?} must not be usable as a profile directory name"
+        );
+    }
+}
+
+#[test]
+fn the_journal_file_is_not_a_usable_profile_directory_name() {
+    // The journal and the per-account profile directories share one
+    // directory, so an identifier equal to the journal's own name would put
+    // a profile store exactly where the swap record lives.
+    let tp = TestPaths::new().unwrap();
+    assert_eq!(
+        tp.desktop_journal_file(),
+        tp.desktop_profile_dir("journal.json"),
+        "the collision under test has to actually be a collision"
+    );
+    assert!(!is_profile_store_component("journal.json"));
+    assert!(
+        !is_profile_store_component("Journal.JSON"),
+        "and the filesystem byte's Windows target uses does not care about case"
     );
 }

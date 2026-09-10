@@ -57,7 +57,26 @@ mod platform {
     }
 
     pub fn status() -> Result<bool> {
-        let key = run_key(false)?;
+        // A missing Run key is "nothing is registered", not a failure.
+        //
+        // Windows creates `...\CurrentVersion\Run` lazily, the first time
+        // something registers a startup item -- so it is always present on a
+        // desktop that has ever had one, and absent on a freshly created
+        // profile that has not. `byte autostart status` must answer the
+        // question on both, and the answer on the latter is `false`.
+        //
+        // This mirrors `disable`'s treatment of an absent *value* just
+        // below; the key deserves the same reading. Found by CI on
+        // `windows-latest`, whose runner profile has no Run key -- a state
+        // no ordinary developer machine can reproduce, which is why it
+        // survived local runs on Windows.
+        let key = match run_key(false) {
+            Ok(key) => key,
+            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        };
         Ok(key.get_value::<String, _>(ENTRY_NAME).is_ok())
     }
 

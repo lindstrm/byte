@@ -4,6 +4,7 @@ pub mod atomic;
 pub mod autostart;
 pub mod claude;
 pub mod cli;
+pub mod desktop;
 pub mod error;
 pub mod lock;
 pub mod ops;

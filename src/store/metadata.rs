@@ -54,6 +54,27 @@ pub struct AccountMeta {
     pub credential_schema: u32,
     pub added_at: String,
     pub last_used_at: Option<String>,
+    /// The parked desktop profile, if one has been captured.
+    ///
+    /// `#[serde(default)]` and skipped when absent, deliberately: this is
+    /// purely additive, so it must not bump the accounts schema and must not
+    /// appear in the files of users who never touch the desktop app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_profile: Option<DesktopProfileRecord>,
+}
+
+/// What byte has parked for one account's desktop session.
+///
+/// Absent means never captured, which is what drives the "park the old
+/// profile, leave a fresh one" behaviour on a first switch (design
+/// decision 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopProfileRecord {
+    /// RFC 3339, matching `added_at`.
+    pub captured_at: String,
+    /// Size on disk when captured, for `byte list` and for warning about
+    /// accumulation.
+    pub bytes: u64,
 }
 
 /// The contents of `accounts.json`.
@@ -74,7 +95,14 @@ impl Default for AccountsFile {
     }
 }
 
-fn now_rfc3339() -> String {
+/// RFC 3339 timestamp, shared by every stamp this file writes (`added_at`,
+/// `last_used_at`) and, from `ops::desktop` (task 8), the `desktop_profile`
+/// capture stamp -- one clock and format for every timestamp byte writes,
+/// rather than a second helper reinventing it. `pub(crate)` rather than
+/// private: `ops::desktop` lives in a sibling module tree and needs it too,
+/// but nothing outside the crate should be able to reach into this file's
+/// internal clock.
+pub(crate) fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| String::from("unknown"))
@@ -178,6 +206,15 @@ impl AccountsFile {
                 None => now_rfc3339(),
             },
             last_used_at: existing.and_then(|i| self.accounts[i].last_used_at.clone()),
+            // Carried forward exactly like `last_used_at` above, not reset:
+            // this is stamped by a wholly separate operation (the desktop
+            // swap's `resolve_mut` call, task 8), not by this credential
+            // sync. Resetting it here would mean an ordinary CLI-only
+            // switch -- one that never touches the desktop app at all --
+            // silently erases the record of a profile that is still sitting
+            // on disk, breaking the "absent means never captured" invariant
+            // the whole feature depends on.
+            desktop_profile: existing.and_then(|i| self.accounts[i].desktop_profile.clone()),
         };
 
         match existing {
@@ -187,21 +224,24 @@ impl AccountsFile {
         meta
     }
 
-    /// Find an account by label, email, or UUID prefix.
-    pub fn resolve(&self, query: &str) -> Result<&AccountMeta> {
+    /// Shared lookup logic: find an account's index by label, email, or UUID
+    /// prefix. Returns the index if exactly one match is found.
+    fn resolve_index(&self, query: &str) -> Result<usize> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
             return Err(Error::NoSuchAccount(query.to_string()));
         }
 
-        let exact: Vec<&AccountMeta> = self
+        let exact: Vec<usize> = self
             .accounts
             .iter()
-            .filter(|a| {
+            .enumerate()
+            .filter(|(_, a)| {
                 a.label.to_lowercase() == q
                     || a.email.as_deref().map(str::to_lowercase) == Some(q.clone())
                     || a.uuid.to_lowercase() == q
             })
+            .map(|(i, _)| i)
             .collect();
 
         if exact.len() == 1 {
@@ -214,12 +254,14 @@ impl AccountsFile {
             });
         }
 
-        let prefixed: Vec<&AccountMeta> = self
+        let prefixed: Vec<usize> = self
             .accounts
             .iter()
-            .filter(|a| {
+            .enumerate()
+            .filter(|(_, a)| {
                 a.uuid.to_lowercase().starts_with(&q) || a.label.to_lowercase().starts_with(&q)
             })
+            .map(|(i, _)| i)
             .collect();
 
         match prefixed.len() {
@@ -230,6 +272,22 @@ impl AccountsFile {
                 count: n,
             }),
         }
+    }
+
+    /// Find an account by label, email, or UUID prefix.
+    pub fn resolve(&self, query: &str) -> Result<&AccountMeta> {
+        Ok(&self.accounts[self.resolve_index(query)?])
+    }
+
+    /// `resolve`'s `&mut` mirror, for a caller that needs to update the
+    /// matched account in place (e.g. stamping a `desktop_profile` record
+    /// after a capture). Matches `resolve`'s lookup semantics exactly --
+    /// same exact-match fields, same ambiguity handling, same uuid/label
+    /// prefix fallback. Uses the shared [`Self::resolve_index`] to ensure
+    /// both lookup paths always agree.
+    pub fn resolve_mut(&mut self, query: &str) -> Result<&mut AccountMeta> {
+        let i = self.resolve_index(query)?;
+        Ok(&mut self.accounts[i])
     }
 
     pub fn rename(&mut self, uuid: &str, label: &str) -> Result<AccountMeta> {

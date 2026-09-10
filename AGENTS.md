@@ -45,10 +45,14 @@ Four layers, each depending only on the ones below it. `cli/` (argument
 parsing, `--json`, rendering — no file I/O or business logic of its own) and
 `tray/` (the Windows/macOS tray app) sit together at the top as byte's two
 front ends →
-`ops/` (switch, add, manage — the operations, generic over the `HostPaths`
-and `SecretStore` traits rather than their concrete implementations) →
-`claude/` (reads and patches Claude Code's two files) and `store/` (account
-metadata and secrets) → `error.rs` / `output.rs` / `paths.rs` / `atomic.rs` /
+`ops/` (switch, add, manage, desktop — the operations, generic over the
+`HostPaths` and `SecretStore` traits rather than their concrete
+implementations) →
+`claude/` (reads and patches Claude Code's two files), `store/` (account
+metadata and secrets), and `desktop/` (Windows only: switches the Claude
+*desktop* app's own session — a separate app with its own OAuth cache and
+web session — alongside Claude Code's, via `ops/desktop.rs`) →
+`error.rs` / `output.rs` / `paths.rs` / `atomic.rs` /
 `lock.rs` / `autostart.rs` (primitives used from every layer above). Nothing in a lower layer imports
 from a higher one; production code instantiates
 `Switcher<&RealPaths, KeyringStore>`, tests instantiate
@@ -104,8 +108,15 @@ config keys| `docs/configuration.md`
   triggers it. Housekeeping (backup pruning) must never turn an
   already-verified, already-committed write into an `Err` — a safety
   mechanism guarding one commit point while another can fail after
-  committing has recurred three times in this codebase (see
-  `atomic::prune`'s doc comment for the most recent instance).
+  committing has recurred four times in this codebase: see
+  `atomic::prune`'s doc comment, and `ops::desktop::record_parked_profile`,
+  which reports a failure to record the `desktop_profile` bookkeeping entry
+  through `output::warn` rather than erroring a desktop switch whose
+  directory renames and `config.json` patch have already committed.
+  `desktop::journal::Journal` is the same discipline applied one level up,
+  for a multi-step swap rather than a single write: the whole planned
+  sequence is recorded before the first step runs, so a crash partway
+  through is repaired by whatever byte command runs next.
 - `JsonDocument` never deserializes a Claude Code file into a typed struct —
   every field byte does not explicitly model must survive a capture/apply
   cycle untouched.

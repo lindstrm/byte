@@ -39,37 +39,74 @@ who can run code as the logged-in user can read them.**
 That is not a new exposure byte introduces for the credential store copy
 specifically: it is equally true today of Claude Code's own credential file,
 `~/.claude/.credentials.json`, which is the source byte copies those tokens
-from in the first place. But byte does hold a live refresh token in three
-places, not one, and the third has none of the other two's protection:
+from in the first place. But byte holds live credentials in five places, not
+one, and only the third has the OS credential store's protection:
 
 1. `~/.claude/.credentials.json` — Claude Code's own file.
-2. The OS credential store — one entry per account byte has stored, under
+2. `%APPDATA%\Claude\config.json` — the Claude desktop app's own file,
+   holding its `oauth:tokenCache` and `oauth:tokenCacheV2`. Listed for the
+   same reason as location 1: it is not byte's doing, it exists whether or
+   not byte is installed, and it is the source byte copies from to produce
+   location 5. A complete inventory of where a live desktop-session token
+   rests on disk has to name it.
+3. The OS credential store — one entry per account byte has stored, under
    the service name `byte-claude-account-switcher`.
-3. `<byte-config-dir>/backups/` — a **plaintext file**, refresh token
+4. `<byte-config-dir>/backups/` — a **plaintext file**, refresh token
    included, written before every capture, switch, and add (see
    [Configuration](docs/configuration.md)). The ten most recent generations
    per file are kept, so more than one past refresh token can be recovered
    from here even after it has been rotated or the account removed.
+5. `<byte-config-dir>/desktop/<account-uuid>/` — a parked Claude desktop
+   session, present only if you have used desktop switching. It holds that
+   account's cookie jar, local storage, and an `oauth.json` capture of the
+   app's own OAuth token cache. **These are live session credentials as
+   ordinary files.** They are not in the credential store, and they cannot
+   be: a cookie jar is tens of megabytes of SQLite and LevelDB, far past
+   what any OS credential store will hold. byte creates the directory
+   owner-only on Unix (mode `0700`); on Windows it inherits the config
+   directory's permissions rather than getting an explicit owner-only ACL,
+   because setting one needs a Win32 dependency byte does not carry.
+   `byte remove` deletes this directory along with the account's other two
+   copies; see below.
 
-Locations 1 and 2 are on equal footing: both rely on the same OS-level
-protections, and neither adds encryption beyond what the platform already
+Locations 1, 2 and 3 are on equal footing: they rely on the same OS-level
+protections, and none adds encryption beyond what the platform already
 provides for a logged-in user's own data — this is the "byte does not
-worsen that posture" claim, and it is true of those two. Location 3 is not
-on that footing: it is an ordinary file with ordinary filesystem
-permissions, with none of the OS credential store's access control, holding
-up to ten generations of history instead of one live copy. A local attacker
-able to run code as you can read a live refresh token from any of the
-three, and the backups directory is the easiest of the three to overlook.
+worsen that posture" claim, and it is true of those three. Locations 4 and
+5 are not on that footing: they are ordinary files with ordinary filesystem
+permissions and none of the OS credential store's access control. Location
+4 additionally holds up to ten generations of history rather than one live
+copy; location 5 holds one live copy per account, but of a *session* rather
+than a refresh token, so revoking it means signing that account out of
+Claude rather than rotating a token.
+
+A local attacker able to run code as you can read live credentials from any
+of the five. Locations 1 and 2 exist with or without byte; 3, 4 and 5 are
+byte's. The backups directory is the easiest to overlook; the desktop
+profile store is the largest, and the only one whose contents byte cannot
+put in a keychain even in principle.
 
 If your threat model includes a local attacker able to run arbitrary code as
 you, the correct response to a suspected compromise is the same regardless
 of which copy was read: revoke the affected account's session from your
 claude.ai account settings. `byte remove <name>` deletes byte's copy of the
-credential from the OS credential store and its metadata entry, but it does
-**not** clear that account's past backups in `backups/` — those age out only
-through the normal ten-generation pruning — and neither `byte remove` nor
-deleting `~/.claude/.credentials.json` revokes the token itself — only
-Anthropic's auth servers can do that.
+credential from the OS credential store, its metadata entry, and that
+account's parked desktop profile in `desktop/` (locations 3 and 5) — the
+prompt names the desktop session explicitly when there is one, since it is a
+signed-in claude.ai session rather than a token. Two things it does not do:
+it does not clear that account's past backups in `backups/`, which age out
+only through the normal ten-generation pruning; and it does not revoke
+anything. Neither `byte remove` nor deleting
+`~/.claude/.credentials.json` invalidates a token or a session — only
+Anthropic's auth servers can do that, so a removal is byte forgetting a
+credential, never the credential ceasing to work.
+
+If the desktop profile cannot be deleted — most often a file inside it still
+held open by another process on Windows — `byte remove` says so and names
+the directory, rather than failing a removal that has already taken the
+keychain entry and the metadata row with it. That warning means location 5
+is still on disk for an account byte can no longer reach, and the directory
+has to be deleted by hand.
 
 `accounts.json`, byte's own metadata file, holds each stored account's
 profile: email, organization name, billing type, organization role,

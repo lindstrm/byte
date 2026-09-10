@@ -430,6 +430,7 @@ fn ghost_meta(uuid: &str, email: &str, account: serde_json::Value, schema: u32) 
         credential_schema: schema,
         added_at: "2026-01-01T00:00:00Z".to_string(),
         last_used_at: None,
+        desktop_profile: None,
     }
 }
 
@@ -537,6 +538,7 @@ fn load_snapshot_reassembles_every_field_from_both_halves() {
         credential_schema: SCHEMA_VERSION,
         added_at: "2026-01-01T00:00:00Z".to_string(),
         last_used_at: None,
+        desktop_profile: None,
     };
 
     let snapshot = sw.load_snapshot(&meta).unwrap();

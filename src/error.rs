@@ -95,6 +95,13 @@ pub enum Error {
          Wait for it to finish and try again."
     )]
     Busy,
+
+    #[error(
+        "a desktop profile swap was interrupted and could not be repaired automatically.\n\
+         Its journal is at {journal}\n\
+         {detail}"
+    )]
+    DesktopSwapInterrupted { journal: PathBuf, detail: String },
 }
 
 /// Convenience alias used throughout the crate.

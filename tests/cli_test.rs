@@ -16,6 +16,12 @@ fn byte(tp: &TestPaths, args: &[&str]) -> std::process::Output {
         .args(args)
         .env("CLAUDE_CONFIG_DIR", tp.root())
         .env("BYTE_CONFIG_DIR", tp.byte_config_dir())
+        // Without this, `RealDesktopPaths::discover()` falls through to the
+        // real `%APPDATA%\Claude` on every platform that has one -- this
+        // suite must never let the compiled binary reach that, exactly like
+        // the two env vars above keep it off the developer's real Claude
+        // Code config.
+        .env("CLAUDE_DESKTOP_DIR", tp.root().join("desktop"))
         .stdin(Stdio::null())
         .output()
         .expect("failed to run byte")
@@ -420,5 +426,189 @@ fn add_json_without_yes_requires_confirmation_and_emits_no_stdout() {
         out.stdout.is_empty(),
         "a rejected --json add must not write partial output to stdout: {:?}",
         String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+// The tests below cover Task 9: wiring desktop switching into the CLI --
+// journal recovery at the start of every command, and surfacing stored
+// desktop profiles in `byte list`. Both stay inside this suite's existing
+// boundary (no secrets, no keychain): recovery only ever touches byte's own
+// config directory, and `list` only reads `accounts.json`.
+
+#[test]
+fn any_command_repairs_an_interrupted_desktop_swap() {
+    // Uses `list`, deliberately, for two reasons. First, the requirement is
+    // that the journal is repaired by whatever byte command runs NEXT --
+    // not only by a retry of `switch` -- and nothing else in this plan
+    // tests that. Second, `list` is keychain-free: a SUCCESSFUL `switch`
+    // through the compiled binary reaches secrets.get(), which for this
+    // binary is the REAL OS keychain. That is why this suite only ever
+    // runs `switch <unknown-name>`, which fails at resolution first.
+    let tp = TestPaths::new().unwrap();
+    seed_one_account(&tp);
+
+    let live = tp.root().join("desktop");
+    std::fs::create_dir_all(&live).unwrap();
+
+    // A half-completed park: one directory is already in the store and the
+    // journal records that move as done, while a second is still sitting in
+    // the live directory with its move outstanding. Both halves matter -- a
+    // journal with NOTHING outstanding describes a swap whose renames all
+    // finished, and is rolled forward rather than undone (see
+    // `desktop::swap::recovery_for`).
+    let parked = tp.desktop_profile_dir("u1").join("Network");
+    std::fs::create_dir_all(&parked).unwrap();
+    std::fs::write(parked.join("marker.txt"), "account-1").unwrap();
+    let still_live = live.join("IndexedDB");
+    std::fs::create_dir_all(&still_live).unwrap();
+    std::fs::write(still_live.join("marker.txt"), "account-1").unwrap();
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(
+        tp.desktop_journal_file(),
+        serde_json::json!({
+            "version": 1,
+            "outgoing": "u1",
+            "incoming": null,
+            "moves": [
+                {
+                    "stage": "Park",
+                    "from": live.join("Network"),
+                    "to": parked,
+                    "done": true
+                },
+                {
+                    "stage": "Park",
+                    "from": still_live,
+                    "to": tp.desktop_profile_dir("u1").join("IndexedDB"),
+                    "done": false
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = byte(&tp, &["list"]);
+
+    assert!(
+        out.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        live.join("Network").join("marker.txt").exists(),
+        "no install move completed, so the park must be reversed and the session restored"
+    );
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "the journal must be cleared once repaired, or every later command repeats the repair"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("repaired"),
+        "a silent repair is indistinguishable from nothing having happened: {stderr}"
+    );
+}
+
+#[test]
+fn an_unrepairable_desktop_journal_does_not_block_other_commands() {
+    // Regression: `recover_if_interrupted` can itself fail -- an unreadable
+    // journal, or one written by an incompatible format version -- and
+    // that failure must not propagate out of `run()` via `?`. If it did,
+    // it would fail EVERY byte command from then on, including read-only
+    // ones that never touch the desktop machinery at all (`list`,
+    // `current`, `autostart`, even starting the tray with no arguments),
+    // with no way to run byte again short of editing the journal file by
+    // hand -- one corrupt file turning into total unavailability of the
+    // whole CLI.
+    let tp = TestPaths::new().unwrap();
+    seed_one_account(&tp);
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(
+        tp.desktop_journal_file(),
+        serde_json::json!({
+            "version": 99,
+            "outgoing": null,
+            "incoming": null,
+            "moves": []
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = byte(&tp, &["list"]);
+
+    assert!(
+        out.status.success(),
+        "an unrepairable journal must not block an unrelated command: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("work"),
+        "the account listing must still have run despite the repair failure: {stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("could not") && stderr.to_lowercase().contains("repair"),
+        "the repair failure must still be reported, not silently swallowed: {stderr}"
+    );
+}
+
+#[test]
+fn list_json_reports_a_stored_desktop_profile() {
+    let tp = TestPaths::new().unwrap();
+    seed_one_account(&tp);
+
+    let before = byte(&tp, &["list", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert!(
+        parsed[0]["desktop_profile"].is_null(),
+        "an account with no stored profile must report null, not omit the field: {parsed}"
+    );
+}
+
+#[test]
+fn list_json_reports_a_stored_desktop_profiles_size() {
+    // Paired with the test above: a `null`-always implementation would pass
+    // that one but not this one, since the field would never carry a
+    // record even when `accounts.json` genuinely has one.
+    let tp = TestPaths::new().unwrap();
+    std::fs::write(
+        tp.accounts_file(),
+        serde_json::json!({
+            "schema": 2,
+            "active": null,
+            "accounts": [{
+                "uuid": "u1",
+                "label": "work",
+                "email": "w@example.com",
+                "organization_name": null,
+                "subscription_type": null,
+                "account": {"accountUuid": "u1", "emailAddress": "w@example.com"},
+                "user_id": null,
+                "credential_schema": SCHEMA_VERSION,
+                "added_at": "2026-01-01T00:00:00Z",
+                "last_used_at": null,
+                "desktop_profile": {
+                    "captured_at": "2026-01-02T00:00:00Z",
+                    "bytes": 4096
+                }
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = byte(&tp, &["list", "--json"]);
+    assert!(
+        out.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed[0]["desktop_profile"]["bytes"], 4096);
+    assert_eq!(
+        parsed[0]["desktop_profile"]["captured_at"],
+        "2026-01-02T00:00:00Z"
     );
 }

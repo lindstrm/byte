@@ -88,6 +88,17 @@ Restart any already-running `claude` session after switching — Claude Code
 only reads its credentials at startup, so a session that's already running
 keeps using the previous account until you restart it.
 
+**On Windows, switching can also move your Claude desktop app's session.**
+If you have used desktop switching, `byte switch` parks the app's current
+session under the account you are leaving and installs the incoming
+account's — which means the app can end up signed out, or signed in as a
+different account, as a result of a command that looks like it only touches
+Claude Code. byte refuses to do it while Claude is running and tells you
+so. See [Desktop app (Windows)](../README.md#desktop-app-windows) for what
+it moves and what it leaves alone, and note that this half of the feature
+has **not** been verified against a real signed-in app — see
+[Desktop app switching is unverified](troubleshooting.md#desktop-app-switching-is-unverified).
+
 ### Optional: give an account a friendlier name
 
 Accounts are labeled from their email address by default. To rename one:

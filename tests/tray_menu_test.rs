@@ -15,6 +15,7 @@ fn listing(uuid: &str, label: &str, org: Option<&str>, active: bool) -> AccountL
             credential_schema: 1,
             added_at: "2026-01-01T00:00:00Z".to_string(),
             last_used_at: None,
+            desktop_profile: None,
         },
         active,
     }

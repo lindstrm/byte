@@ -20,6 +20,12 @@ claude account switcher
 - Every write is backed up first, replaced atomically, and verified
   afterward, so a crash mid-switch can't corrupt `~/.claude.json`.
 - Scriptable: every command accepts `--json` for machine-readable output.
+- On Windows, `byte switch` also switches the Claude *desktop* app's own
+  session, so one command moves both — see
+  [Desktop app (Windows)](#desktop-app-windows). Its per-account session
+  store holds live credentials as ordinary files, the one place byte keeps a
+  secret outside the OS credential store, because those credentials don't
+  fit in one.
 
 ## Prerequisites
 
@@ -65,10 +71,10 @@ byte switch personal
 | `byte` | Start the tray icon (Windows and macOS only — see [Tray](#tray); fails on other platforms) |
 | `byte list` | List stored accounts; the active one is marked with `*` |
 | `byte current` | Print the active account's label |
-| `byte switch <name>` | Switch to a stored account |
+| `byte switch <name>` | Switch to a stored account (on Windows, also switches the Claude desktop app's session — see [Desktop app (Windows)](#desktop-app-windows)) |
 | `byte capture` | Save the currently logged-in account |
 | `byte add [--timeout <secs>] [--yes]` | Log out, then save the next account you log in as (default 300s; prompts before logging out unless `--yes` is given) |
-| `byte remove <name> [--yes]` | Forget a stored account (irreversible; prompts for confirmation unless `--yes` is given) |
+| `byte remove <name> [--yes]` | Forget a stored account, including its stored Claude desktop session (irreversible; prompts for confirmation unless `--yes` is given) |
 | `byte rename <name> <label>` | Change an account's display label |
 | `byte autostart enable\|disable\|status` | Opt in (or out) of starting the tray at login |
 
@@ -122,14 +128,81 @@ explicitly; `byte autostart status` reports whether it's registered, and
 [Configuration](docs/configuration.md) for exactly where each platform
 registers it.
 
+## Desktop app (Windows)
+
+On Windows, `byte switch` also switches the Claude **desktop** app's own
+session, right after the Claude Code switch completes — one command moves
+both. This only happens for a CLI `byte switch`; a tray click switches
+Claude Code alone (see [Tray](#tray) above), so if you mostly use the tray,
+the desktop app can sit on a different account until you run `byte switch`
+from a terminal once.
+
+What moves with the account: its chat session (cookies, local/session
+storage) and the Code tab's conversation history — so switching away from an
+account hides its Code-tab history in the app until you switch back to it.
+`config.json` is patched in place rather than moved, since it also holds
+your theme, window size, and other preferences; only the handful of keys
+that identify the signed-in account are touched. MCP server configuration,
+cached artifact partitions, and other app preferences are left alone
+entirely.
+
+Switching to an account that has never had a desktop session captured
+leaves the app **signed out** — there is nothing stored for it yet. Sign in
+there once and byte captures that session automatically the next time you
+switch away from it, the same way `byte add` captures a fresh Claude Code
+login.
+
+If Claude is running, the desktop half is skipped and reported instead of
+attempted, since moving its files out from underneath a running process
+risks corrupting the session. Quit Claude and run the same switch again to
+move it.
+
+**Whose session is it?** byte files the live desktop session under the
+account the app itself says it is signed in as (`config.json`'s
+`lastKnownAccountUuid`), not under whichever account Claude Code happened to
+be on — the two drift apart the moment you use the tray, or sign into Claude
+Desktop by hand. Where it cannot tell (the app reports a different account,
+or reports none while byte already has a session stored for that account),
+it changes nothing and says so rather than filing one account's cookies
+under another's name. Fix that by signing in to Claude Desktop as the
+account you want; byte captures it on the next switch away.
+
+**Credentials on disk.** A desktop session's cookies don't fit in the OS
+credential store, so each account's parked session is stored as ordinary
+files under `<byte config dir>/desktop/` instead — the one place byte keeps
+a secret outside the OS credential store. See
+[Configuration](docs/configuration.md#the-desktop-profile-store) for exactly
+what that means for its permissions (in short: it inherits the config
+directory's own permissions, and is not additionally ACL-restricted on
+Windows). `byte remove` deletes that directory along with the account's
+keychain entry, and says so in its confirmation prompt when there is one to
+delete — but deleting byte's copy is not the same as revoking the session,
+which only claude.ai can do. See [Security](SECURITY.md).
+
+**Unverified.** No automated test exercises the real Claude desktop app —
+they all run against a synthetic directory tree instead, which is the only
+way to test this without risking the tester's own session. Whether this
+actually changes what a real, signed-in Claude shows is therefore unproven,
+not merely untested-by-CI. See
+[Troubleshooting](docs/troubleshooting.md#desktop-app-switching-is-unverified)
+for exactly what would verify it.
+
+Windows only, and only where the app is actually installed. On macOS and
+Linux — and on a Windows machine with no `%APPDATA%\Claude` directory,
+because Claude Desktop was never installed or never run — `byte switch`
+behaves exactly as it did before this feature existed: no desktop half is
+attempted, nothing is created for it, and nothing is reported about it.
+
 ## Configuration
 
-byte reads two environment variables:
+byte reads three environment variables — the third only on Windows, and only
+for the desktop half of `switch` described above:
 
 | Variable | Effect |
 |---|---|
 | `CLAUDE_CONFIG_DIR` | Overrides where Claude Code's `.claude.json` and `.credentials.json` are read from |
-| `BYTE_CONFIG_DIR` | Overrides byte's own config directory (`accounts.json`, `backups/`) |
+| `BYTE_CONFIG_DIR` | Overrides byte's own config directory (`accounts.json`, `backups/`, `desktop/`) |
+| `CLAUDE_DESKTOP_DIR` | Overrides where the Claude desktop app's own data is read from (normally `%APPDATA%\Claude`) |
 
 See [Configuration](docs/configuration.md) for default paths per platform and
 how a stored account is split between `accounts.json` and the OS keychain.
