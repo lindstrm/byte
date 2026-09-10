@@ -65,6 +65,21 @@ pub fn classify(entry_name: &str) -> Disposition {
     if name == "config.json" {
         return Disposition::Patch;
     }
+    // byte's own captured-OAuth file (`desktop::config`/`ops::desktop`),
+    // written directly inside a profile-store directory alongside the
+    // entries that DO move with the account. It must stay exactly where
+    // classify's caller finds it: on the install side, `ops::desktop` reads
+    // it back from that same directory right after the swap completes, and
+    // moving it into the live app directory would both litter that
+    // directory with a file Claude Desktop has never heard of and delete
+    // the only copy byte has left to restore from -- silently replacing a
+    // real restore with defaults. Not part of `LEAVE` below, whose own doc
+    // comment ("junk, shared, or self-segregating") does not describe this
+    // file any better than it describes `config.json` above: both are
+    // single, deliberate exceptions, not entries in a general list.
+    if name == "oauth.json" {
+        return Disposition::Leave;
+    }
     if LEAVE.contains(&name.as_str()) {
         return Disposition::Leave;
     }

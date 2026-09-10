@@ -78,6 +78,19 @@ fn config_json_is_patched_not_moved_or_left() {
 }
 
 #[test]
+fn byte_own_oauth_capture_file_stays_with_its_profile() {
+    // Regression (found integrating task 8): this file did not exist when
+    // the denylist above was written, and it lives in the very directories
+    // `movable_entries` scans as `install_from`/`park_to` (see
+    // `ops::desktop`). Without this exception it is silently swept into the
+    // live desktop directory on every install from a profile that has
+    // already been parked once, deleting the copy `ops::desktop` reads back
+    // afterwards to restore the incoming account's real session.
+    assert_eq!(classify("oauth.json"), Disposition::Leave);
+    assert_eq!(classify("OAuth.JSON"), Disposition::Leave);
+}
+
+#[test]
 fn an_unrecognised_entry_moves() {
     // The denylist decision (design §3): state byte has not identified --
     // including whatever a future app version adds -- travels with the

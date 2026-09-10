@@ -135,6 +135,66 @@ fn the_outgoing_accounts_oauth_is_parked_with_its_profile() {
 }
 
 #[test]
+fn a_second_switch_into_a_previously_parked_account_restores_its_real_oauth_not_defaults() {
+    // Regression: `oauth.json` (byte's own capture, written directly inside
+    // the profile directory by this module) did not exist when
+    // `desktop::profile`'s denylist was written, so `movable_entries`
+    // classified it as ordinary account state. Left unfixed, installing
+    // FROM a profile that has already been parked once (so it holds both a
+    // moved directory and its `oauth.json` companion) would sweep
+    // `oauth.json` into the live desktop directory along with everything
+    // else -- littering an app directory Claude Desktop has never heard of
+    // AND deleting the very file this function reads back afterwards,
+    // silently replacing the incoming account's real oauth with
+    // `DesktopOauth::default()` instead of restoring it.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+
+    // "a" is live, fully signed in with a real token cache.
+    let dir = dp.desktop_dir().join("Network");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker.txt"), "account-a").unwrap();
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({
+            "lastKnownAccountUuid": "account-a",
+            "oauth:tokenCache": {"accessToken": "a-token"},
+            "locale": "en-GB"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let probe = FakeProbe::with_desktop(0, false);
+
+    // Switch away to "b" (uncaptured): this parks "a", writing its
+    // oauth.json alongside the freshly moved "Network" directory -- the
+    // exact shape a previously-parked profile has.
+    switch_desktop(&tp, &dp, &probe, Some("a"), "b").unwrap();
+    assert!(tp.desktop_profile_dir("a").join("oauth.json").exists());
+
+    // Now switch back to "a". Its stored profile has both "Network" AND
+    // "oauth.json" sitting side by side -- the scenario the denylist never
+    // saw when it was written.
+    switch_desktop(&tp, &dp, &probe, Some("b"), "a").unwrap();
+
+    assert!(
+        !dp.desktop_dir().join("oauth.json").exists(),
+        "byte's own oauth capture file must never be installed into the app's live directory"
+    );
+    assert!(
+        tp.desktop_profile_dir("a").join("oauth.json").exists(),
+        "it must stay behind in the store, available for a future switch"
+    );
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert_eq!(
+        cfg["oauth:tokenCache"],
+        serde_json::json!({"accessToken": "a-token"}),
+        "the real captured token cache must be restored, not silently defaulted"
+    );
+}
+
+#[test]
 fn parking_a_profile_records_it_against_the_account() {
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
