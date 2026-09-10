@@ -10,9 +10,17 @@
 
 use std::path::Path;
 
-/// Something that can count running Claude Code sessions.
+/// Something that can count running Claude Code sessions and check app state.
 pub trait ProcessProbe: Send + Sync {
     fn running_claude_sessions(&self) -> usize;
+
+    /// Whether the Claude desktop app is running.
+    ///
+    /// The inverse reading of `is_claude_desktop_app`, which exists to
+    /// EXCLUDE the app from session counts. A profile swap needs the app
+    /// closed -- Chromium corrupts profile state otherwise -- so this gates
+    /// the desktop half of a switch.
+    fn desktop_app_running(&self) -> bool;
 }
 
 /// Decide whether one process is a Claude Code session.
@@ -159,22 +167,45 @@ impl ProcessProbe for SysinfoProbe {
             })
             .count()
     }
+
+    fn desktop_app_running(&self) -> bool {
+        use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+
+        let system = System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_processes(ProcessRefreshKind::nothing().with_exe(UpdateKind::Always)),
+        );
+
+        system
+            .processes()
+            .values()
+            .any(|p| is_claude_desktop_app(p.exe()))
+    }
 }
 
-/// A probe that reports a fixed count, for tests.
+/// A probe that reports a fixed count and desktop app state, for tests.
 #[derive(Debug, Clone, Copy)]
 pub struct FakeProbe {
     count: usize,
+    desktop: bool,
 }
 
 impl FakeProbe {
     pub fn with_count(count: usize) -> Self {
-        Self { count }
+        Self { count, desktop: false }
+    }
+
+    pub fn with_desktop(count: usize, desktop: bool) -> Self {
+        Self { count, desktop }
     }
 }
 
 impl ProcessProbe for FakeProbe {
     fn running_claude_sessions(&self) -> usize {
         self.count
+    }
+
+    fn desktop_app_running(&self) -> bool {
+        self.desktop
     }
 }

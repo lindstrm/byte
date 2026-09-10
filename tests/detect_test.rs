@@ -187,3 +187,13 @@ fn the_composed_classifier_counts_the_cli_and_excludes_the_desktop_app() {
         "the Windows desktop app must not count as a Claude Code session"
     );
 }
+
+#[test]
+fn a_fake_probe_reports_the_desktop_app_state_it_was_given() {
+    assert!(!FakeProbe::with_count(3).desktop_app_running());
+    assert!(FakeProbe::with_desktop(0, true).desktop_app_running());
+    assert!(!FakeProbe::with_desktop(2, false).desktop_app_running());
+    // The two readings are independent: sessions running does not imply the
+    // app is, and vice versa.
+    assert_eq!(FakeProbe::with_desktop(2, true).running_claude_sessions(), 2);
+}
