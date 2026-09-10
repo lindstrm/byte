@@ -45,6 +45,19 @@ written; observed write times on a single day:
 | `%APPDATA%\Claude\config.json` | 20:17 |
 | `~\.claude\.credentials.json` | 19:04 |
 
+**The two account identifiers are the same identifier space.** The desktop
+app's `lastKnownAccountUuid` and Claude Code's `oauthAccount.accountUuid`
+hold the same value for the same account -- measured directly on a real
+signed-in machine on 2026-09-09, both reading
+`4d32c114-7f8d-431a-bffb-b2448a5e8ebf`. This is load-bearing: `switch_desktop`
+refuses to park the live desktop session when `lastKnownAccountUuid` names an
+account other than the one byte is filing it under, which is what stops a
+tray switch (which does not move the desktop half) from causing the next CLI
+switch to file one account's session under another's uuid. If the two were
+*different* identifier spaces, that guard would refuse the desktop half on
+every switch rather than only on a genuine mismatch. Re-check this first if
+desktop switching ever appears to refuse universally.
+
 **Confidence note.** That the cookie jar is rewritten continuously while
 signed in is strong evidence the web view maintains its own authenticated
 session, and therefore that patching `config.json` alone would not switch the
