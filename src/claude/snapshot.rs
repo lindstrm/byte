@@ -71,10 +71,6 @@ impl AccountSnapshot {
         self.account_str("organizationName")
     }
 
-    pub fn organization_uuid(&self) -> Option<&str> {
-        self.account_str("organizationUuid")
-    }
-
     pub fn subscription_type(&self) -> Option<&str> {
         self.oauth.get("subscriptionType").and_then(Value::as_str)
     }

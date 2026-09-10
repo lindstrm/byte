@@ -42,16 +42,12 @@ impl<P: HostPaths + Copy, S: SecretStore> Switcher<P, S> {
         &self.secrets
     }
 
-    pub fn paths(&self) -> &P {
-        &self.paths
-    }
-
     fn files(&self) -> ClaudeFiles<P> {
         ClaudeFiles::new(self.paths)
     }
 
     /// Exposed for the add flow, which needs direct file access.
-    pub fn files_for_add(&self) -> ClaudeFiles<P> {
+    pub(crate) fn files_for_add(&self) -> ClaudeFiles<P> {
         self.files()
     }
 

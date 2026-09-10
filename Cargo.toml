@@ -28,7 +28,7 @@ serde_json = { version = "1.0.151", features = ["preserve_order", "float_roundtr
 sysinfo = "0.38.4"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
-time = { version = "0.3.55", features = ["formatting", "parsing", "macros", "serde"] }
+time = { version = "0.3.55", features = ["formatting"] }
 
 # `cfg(windows)`, not a single triple: `src/autostart.rs` gates its winreg
 # consumer on `#[cfg(windows)]`, which is every `*-pc-windows-*` target.
