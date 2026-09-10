@@ -39,18 +39,24 @@ who can run code as the logged-in user can read them.**
 That is not a new exposure byte introduces for the credential store copy
 specifically: it is equally true today of Claude Code's own credential file,
 `~/.claude/.credentials.json`, which is the source byte copies those tokens
-from in the first place. But byte holds live credentials in four places, not
-one, and only the second has the OS credential store's protection:
+from in the first place. But byte holds live credentials in five places, not
+one, and only the third has the OS credential store's protection:
 
 1. `~/.claude/.credentials.json` — Claude Code's own file.
-2. The OS credential store — one entry per account byte has stored, under
+2. `%APPDATA%\Claude\config.json` — the Claude desktop app's own file,
+   holding its `oauth:tokenCache` and `oauth:tokenCacheV2`. Listed for the
+   same reason as location 1: it is not byte's doing, it exists whether or
+   not byte is installed, and it is the source byte copies from to produce
+   location 5. A complete inventory of where a live desktop-session token
+   rests on disk has to name it.
+3. The OS credential store — one entry per account byte has stored, under
    the service name `byte-claude-account-switcher`.
-3. `<byte-config-dir>/backups/` — a **plaintext file**, refresh token
+4. `<byte-config-dir>/backups/` — a **plaintext file**, refresh token
    included, written before every capture, switch, and add (see
    [Configuration](docs/configuration.md)). The ten most recent generations
    per file are kept, so more than one past refresh token can be recovered
    from here even after it has been rotated or the account removed.
-4. `<byte-config-dir>/desktop/<account-uuid>/` — a parked Claude desktop
+5. `<byte-config-dir>/desktop/<account-uuid>/` — a parked Claude desktop
    session, present only if you have used desktop switching. It holds that
    account's cookie jar, local storage, and an `oauth.json` capture of the
    app's own OAuth token cache. **These are live session credentials as
@@ -61,19 +67,20 @@ one, and only the second has the OS credential store's protection:
    directory's permissions rather than getting an explicit owner-only ACL,
    because setting one needs a Win32 dependency byte does not carry.
 
-Locations 1 and 2 are on equal footing: both rely on the same OS-level
-protections, and neither adds encryption beyond what the platform already
+Locations 1, 2 and 3 are on equal footing: they rely on the same OS-level
+protections, and none adds encryption beyond what the platform already
 provides for a logged-in user's own data — this is the "byte does not
-worsen that posture" claim, and it is true of those two. Locations 3 and 4
-are not on that footing: they are ordinary files with ordinary filesystem
+worsen that posture" claim, and it is true of those three. Locations 4 and
+5 are not on that footing: they are ordinary files with ordinary filesystem
 permissions and none of the OS credential store's access control. Location
-3 additionally holds up to ten generations of history rather than one live
-copy; location 4 holds one live copy per account, but of a *session* rather
+4 additionally holds up to ten generations of history rather than one live
+copy; location 5 holds one live copy per account, but of a *session* rather
 than a refresh token, so revoking it means signing that account out of
 Claude rather than rotating a token.
 
 A local attacker able to run code as you can read live credentials from any
-of the four. The backups directory is the easiest to overlook; the desktop
+of the five. Locations 1 and 2 exist with or without byte; 3, 4 and 5 are
+byte's. The backups directory is the easiest to overlook; the desktop
 profile store is the largest, and the only one whose contents byte cannot
 put in a keychain even in principle.
 
