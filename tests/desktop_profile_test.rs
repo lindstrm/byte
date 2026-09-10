@@ -25,6 +25,8 @@ fn caches_and_binaries_and_logs_are_left_behind() {
         "DawnGraphiteCache",
         "DawnWebGPUCache",
         "blob_storage",
+        "shared_proto_db",
+        "videodecodestats",
         "logs",
         "Crashpad",
         "sentry",
@@ -68,6 +70,23 @@ fn the_mcp_config_and_usage_counter_stay() {
     // 68 bytes, one key `tokens-today` -- an LLM usage counter, not
     // credentials, despite the name.
     assert_eq!(classify("buddy-tokens.json"), Disposition::Leave);
+}
+
+#[test]
+fn the_users_own_settings_and_this_machines_device_registration_stay() {
+    // Not credentials and not per-account: the user's app preferences, their
+    // window geometry, and this installation's device registration. Letting
+    // any of them travel with the account means the user's own settings
+    // vanish on the first switch and reappear only when they switch back.
+    for name in [
+        "Preferences",
+        "window-state.json",
+        "bridge-state.json",
+        "ant-device-registry.json",
+        "ant-did",
+    ] {
+        assert_eq!(classify(name), Disposition::Leave, "{name} should stay");
+    }
 }
 
 #[test]

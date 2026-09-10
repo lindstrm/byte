@@ -6,7 +6,7 @@ use crate::autostart;
 use crate::claude::detect::{ProcessProbe, SysinfoProbe};
 use crate::cli::{AutostartAction, Cli, Command};
 use crate::desktop::paths::{DesktopPaths, RealDesktopPaths};
-use crate::desktop::swap::{IdentityRepair, Repair};
+use crate::desktop::swap::{IdentityRepair, Recovery, Repair};
 use crate::error::{Error, Result};
 use crate::lock::MutationGuard;
 use crate::ops::add::AddSession;
@@ -40,7 +40,12 @@ pub fn run(cli: Cli) -> Result<()> {
     // failure to switch the desktop half once paths ARE available is a
     // different matter, and is reported -- see `cmd_switch`'s own handling,
     // and `recover_under_lock`'s `Deferred` case.
-    let desktop = RealDesktopPaths::discover().ok();
+    //
+    // Discovery alone is not enough, though: `%APPDATA%` is set for every
+    // interactive Windows user, so it succeeds on every Windows machine
+    // whether or not Claude Desktop is installed. See
+    // `desktop_paths_if_installed`.
+    let desktop = desktop_paths_if_installed(RealDesktopPaths::discover().ok());
 
     // Every command begins by repairing a desktop swap that an earlier run
     // left half-finished -- but only while it can take the mutation lock,
@@ -97,6 +102,35 @@ pub fn run(cli: Cli) -> Result<()> {
             cmd_rename(&switcher, &name, &label, cli.json)
         }
     }
+}
+
+/// The desktop paths to use, or `None` when Claude Desktop is not installed.
+///
+/// `RealDesktopPaths::discover()` answers "where WOULD the app keep its
+/// data", and on Windows that succeeds for every interactive user, installed
+/// or not. Acting on that alone made byte manufacture an entire desktop half
+/// for an application that is not there: a `<byte>/desktop/<uuid>/oauth.json`
+/// of nulls, a `%APPDATA%\Claude\config.json` holding `{}` created by
+/// `config::clear`'s own write, a `desktop_profile` record that makes `byte
+/// list` report a session that does not exist, and a message on every single
+/// switch. `docs/troubleshooting.md` promises the opposite -- silence, and a
+/// `null` `desktop` field under `--json` -- and this is what makes that
+/// true.
+///
+/// Recovery is gated the same way, and safely: a journal can only exist
+/// because a swap ran, which needs these same paths, so a machine without
+/// the app has nothing to repair. In the one degenerate case -- the app
+/// uninstalled while a swap was interrupted -- `recover_if_interrupted`
+/// still repairs the DIRECTORY half from the journal's own absolute paths
+/// and reports `Deferred`, which is exactly the "only a command that can
+/// find the app can finish this" state that variant exists for.
+///
+/// Takes the discovered value rather than discovering itself, so the gate is
+/// testable against a `TestDesktopPaths` instead of only through
+/// process-global environment variables -- the same split as
+/// `RealPaths::resolve` and `RealDesktopPaths::resolve`.
+pub fn desktop_paths_if_installed<D: DesktopPaths>(discovered: Option<D>) -> Option<D> {
+    discovered.filter(DesktopPaths::is_installed)
 }
 
 /// Repair a desktop swap left behind by a crash -- but only while this
@@ -188,6 +222,21 @@ pub fn repair_message(repair: &Repair) -> String {
         IdentityRepair::Restored | IdentityRepair::NotNeeded => {
             format!("repaired an interrupted desktop profile swap ({recovery:?}).")
         }
+        // The same unreadable file means opposite things in the two
+        // directions, and `restore_identity` treats them that way: a
+        // roll-forward CLEARS the app's account keys rather than leave the
+        // outgoing account's over the incoming account's cookies, so the app
+        // really does open signed out. A reversal writes nothing at all --
+        // `config.json` still describes the very session the reversal put
+        // back -- so predicting a signed-out app there would send the user
+        // to sign in over a session that works.
+        IdentityRepair::Unreadable(path) if recovery == Recovery::Reverse => format!(
+            "repaired an interrupted desktop profile swap ({recovery:?}). The saved sign-in at \
+             {} could not be read, but nothing needed it: Claude Desktop's own config already \
+             describes the session that was put back, so it will open as that account. byte \
+             will capture a fresh saved sign-in the next time you switch away from it.",
+            path.display()
+        ),
         IdentityRepair::Unreadable(path) => format!(
             "repaired an interrupted desktop profile swap ({recovery:?}), but the saved \
              sign-in at {} could not be read, so Claude Desktop may open signed out. Sign in \
@@ -548,12 +597,12 @@ fn report_desktop_outcome(outcome: &Result<DesktopOutcome>) {
         // `already_active` guard) -- so the fix, when one is actually
         // needed, has to happen by hand, directly in the app.
         Ok(DesktopOutcome::IdentityMismatch) => output::warn(
-            "Claude's desktop app is signed in as a different account than byte expected \
-             there, so its session was left alone rather than filed under the wrong account \
-             -- nothing changed. If it's already showing the account you just switched to, \
-             there is nothing more to do. Otherwise, sign out of Claude Desktop and sign in \
-             again there as the account you want; byte will capture that session the next \
-             time you switch away from it.",
+            "Claude's desktop app is not signed in as the account byte expected there, so its \
+             session was left alone rather than filed under the wrong account -- nothing \
+             changed. If it's already showing the account you just switched to, there is \
+             nothing more to do. Otherwise, sign out of Claude Desktop and sign in again \
+             there as the account you want; byte will capture that session the next time you \
+             switch away from it.",
         ),
         // The profile moved, but the account's saved sign-in could not be
         // read, so the app will open signed out. `switch_desktop` has
@@ -718,10 +767,35 @@ pub fn resolve_add_failure(
     }
 }
 
+/// What `byte remove` asks before it does anything.
+///
+/// The desktop session is named explicitly when there is one, rather than
+/// left inside "its stored credentials": that directory is a live claude.ai
+/// session and a saved sign-in as plain files, it is the one credential byte
+/// keeps outside the OS credential store (SECURITY.md, location 5), and it
+/// is far and away the most consequential thing this command destroys. A
+/// prompt that only implies it is asking for consent the user has not
+/// knowingly given.
+///
+/// `pub` (like `running_sessions_warning` and `repair_message`) specifically
+/// so both wordings are directly testable without a keychain or a terminal.
+pub fn remove_prompt(label: &str, has_desktop_session: bool) -> String {
+    if has_desktop_session {
+        format!(
+            "Remove '{label}'? Its stored credentials AND its saved Claude Desktop session -- \
+             that account's signed-in claude.ai session on this machine -- are both deleted, \
+             and cannot be recovered afterward."
+        )
+    } else {
+        format!("Remove '{label}'? Its stored credentials cannot be recovered afterward.")
+    }
+}
+
 /// `byte remove` is unlike every other write byte performs: the OS keychain
-/// entry it deletes has no backup, so a removal is genuinely unrecoverable
-/// except by re-authenticating with `byte add`. It must not proceed without
-/// explicit confirmation.
+/// entry it deletes has no backup, and the parked desktop session it deletes
+/// has none either, so a removal is genuinely unrecoverable except by
+/// re-authenticating with `byte add` and signing in to Claude Desktop again.
+/// It must not proceed without explicit confirmation.
 fn cmd_remove<P: HostPaths + Copy, S: SecretStore>(
     sw: &Switcher<P, S>,
     name: &str,
@@ -731,8 +805,12 @@ fn cmd_remove<P: HostPaths + Copy, S: SecretStore>(
     if !yes {
         // Resolve first, so an unknown name still reports NoSuchAccount
         // rather than demanding confirmation for an account that was never
-        // going to be removed anyway.
-        let label = sw.load_accounts()?.resolve(name)?.label.clone();
+        // going to be removed anyway. The uuid comes along because the
+        // prompt below has to say whether there is a desktop session to
+        // delete, and that is keyed by uuid, not by the name typed.
+        let accounts = sw.load_accounts()?;
+        let account = accounts.resolve(name)?;
+        let (label, uuid) = (account.label.clone(), account.uuid.clone());
 
         // --json is for scripts: a prompt would corrupt machine-readable
         // stdout, and would block forever on stdin nobody is watching, so
@@ -745,9 +823,8 @@ fn cmd_remove<P: HostPaths + Copy, S: SecretStore>(
             });
         }
 
-        if !output::confirm(&format!(
-            "Remove '{label}'? Its stored credentials cannot be recovered afterward."
-        )) {
+        let has_desktop = manage::has_desktop_profile(sw.paths(), &uuid);
+        if !output::confirm(&remove_prompt(&label, has_desktop)) {
             output::info("Aborted; nothing was removed.");
             return Ok(());
         }

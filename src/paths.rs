@@ -43,13 +43,54 @@ pub trait HostPaths: Send + Sync {
 
     /// The in-progress swap journal. Present only mid-swap.
     fn desktop_journal_file(&self) -> PathBuf {
-        self.desktop_store_dir().join("journal.json")
+        self.desktop_store_dir().join(JOURNAL_FILE_NAME)
     }
 
     /// One account's parked profile.
+    ///
+    /// Callers must satisfy [`is_profile_store_component`] for
+    /// `account_uuid` first; this join cannot check it (see that function
+    /// for what an unchecked value does to the path).
     fn desktop_profile_dir(&self, account_uuid: &str) -> PathBuf {
         self.desktop_store_dir().join(account_uuid)
     }
+}
+
+/// The swap journal's name inside the profile store.
+///
+/// Named rather than inlined because [`is_profile_store_component`] has to
+/// refuse it: the journal and the per-account profile directories share one
+/// directory, so an account identifier of `journal.json` would name the
+/// journal itself.
+const JOURNAL_FILE_NAME: &str = "journal.json";
+
+/// Is `name` usable as ONE entry name inside the desktop profile store?
+///
+/// [`HostPaths::desktop_profile_dir`] joins this string straight onto the
+/// store path, and `Path::join` is not a string append: an absolute
+/// component REPLACES the base outright, a separator nests, and `..` walks
+/// up. An unvalidated value therefore redirects not only the park itself but
+/// the `to` paths the swap journal records -- which is what a later recovery
+/// renames against, and what `ops::manage::remove` later deletes.
+///
+/// That matters because the string is not always byte's own. With Claude
+/// Code logged out, `ops::desktop::park_target` derives the park target from
+/// the desktop app's `config.json` (`lastKnownAccountUuid`) rather than from
+/// byte's `accounts.json`. Anyone able to write that file can already write
+/// the profile store, so this is not a privilege boundary -- it is the
+/// ordinary rule that input byte did not produce does not get to steer a
+/// path.
+///
+/// Deliberately a check on SHAPE, not on content: byte treats account
+/// identifiers as opaque strings everywhere else (see `store::metadata`), so
+/// "must look like a uuid" would be a new assumption about the format of
+/// somebody else's identifier.
+pub fn is_profile_store_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.eq_ignore_ascii_case(JOURNAL_FILE_NAME)
+        && !name.contains(['/', '\\', ':', '\0'])
 }
 
 /// Lets `&TestPaths` and `&RealPaths` satisfy `HostPaths`, so callers can hold

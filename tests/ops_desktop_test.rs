@@ -221,9 +221,21 @@ fn parking_a_profile_records_it_against_the_account() {
 
     let back = byte::store::metadata::AccountsFile::load(&tp.accounts_file()).unwrap();
     let rec = back.resolve("a").unwrap().desktop_profile.clone().unwrap();
-    assert!(
-        rec.bytes > 0,
-        "a parked profile with files in it must record a nonzero size"
+    // Pinned to the exact total, because the interesting half of `dir_size`
+    // is its recursion. The park directory holds `oauth.json` at its top
+    // level and `Network/marker.txt` one level down, so a `dir_size` that
+    // contributed zero for directories -- or double-counted them -- would
+    // still satisfy "greater than zero" on the top-level file alone.
+    let park = tp.desktop_profile_dir("a");
+    let oauth = std::fs::metadata(park.join("oauth.json")).unwrap().len();
+    let marker = std::fs::metadata(park.join("Network/marker.txt"))
+        .unwrap()
+        .len();
+    assert!(oauth > 0 && marker > 0, "the fixture must have real files");
+    assert_eq!(
+        rec.bytes,
+        oauth + marker,
+        "the recorded size must include the nested file, so the walk has to descend"
     );
     assert!(!rec.captured_at.is_empty());
 }
@@ -953,4 +965,226 @@ fn an_unrecognised_oauth_key_travels_with_the_account_through_a_real_switch() {
         "a's unrecognised cache must come back with a's profile"
     );
     assert_eq!(cfg["locale"], serde_json::json!("en-GB"));
+}
+
+// ---------------------------------------------------------------------------
+// A logged-out Claude Code (`outgoing: None`) over a desktop app that reports
+// no identity of its own. byte manufactures this precondition itself:
+// `config::clear` removes `lastKnownAccountUuid` at the very moment the live
+// directory holds the freshly installed account's real cookies, and the tray
+// switches Claude Code without touching the desktop app at all.
+// ---------------------------------------------------------------------------
+
+/// A live desktop directory holding a real session under an app that reports
+/// no identity -- exactly what `config::clear` leaves behind.
+fn seed_live_unidentified(d: &TestDesktopPaths, entry: &str, marker: &str) {
+    let dir = d.desktop_dir().join(entry);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker.txt"), marker).unwrap();
+    std::fs::write(
+        d.config_file(),
+        serde_json::json!({"locale": "en-GB"}).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_logged_out_code_over_an_unidentified_live_session_installs_nothing_on_top_of_it() {
+    // The silent half: the live entry names and the stored profile's are
+    // DISJOINT, so every install rename succeeds. `outgoing: None` plus an
+    // absent `lastKnownAccountUuid` used to plan zero parks, so a's cookie
+    // jar stayed in the live directory while b's session was installed
+    // beside it and b's identity stamped over the pair -- reported as a clean
+    // `Switched`, with no journal left to say otherwise.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live_unidentified(&dp, "Network", "account-a");
+    let live_config = std::fs::read_to_string(dp.config_file()).unwrap();
+    let stored = tp.desktop_profile_dir("b").join("IndexedDB");
+    std::fs::create_dir_all(&stored).unwrap();
+    std::fs::write(stored.join("marker.txt"), "account-b").unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), None, "b").unwrap();
+
+    assert_eq!(
+        out,
+        DesktopOutcome::IdentityMismatch,
+        "byte cannot tell whose session a non-empty live directory is when neither half names \
+         an account, so it must touch nothing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-a",
+        "the live session must stay exactly where it is"
+    );
+    assert!(
+        !dp.desktop_dir().join("IndexedDB").exists(),
+        "b's stored session must not be installed alongside a's live one"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dp.config_file()).unwrap(),
+        live_config,
+        "the refusal must be byte-for-byte side-effect-free, config.json included"
+    );
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "no swap may have been planned, let alone started"
+    );
+}
+
+#[test]
+fn a_logged_out_code_over_an_unidentified_live_session_never_collides_into_a_wedge() {
+    // The loud half, and the worse one. Two real profiles both hold
+    // `Network`, so the install's rename lands on an occupied destination and
+    // fails -- leaving a journal behind over a live directory that now holds
+    // a mix of two accounts' trees. With more than one install entry an
+    // earlier one has already landed by then, so `recovery_for` picks
+    // `RollForward` and every later byte command retries the identical
+    // failing rename forever.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live_unidentified(&dp, "Network", "account-a");
+    let stored = tp.desktop_profile_dir("b").join("Network");
+    std::fs::create_dir_all(&stored).unwrap();
+    std::fs::write(stored.join("marker.txt"), "account-b").unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), None, "b").unwrap();
+
+    assert_eq!(out, DesktopOutcome::IdentityMismatch);
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-a"
+    );
+    assert_eq!(
+        std::fs::read_to_string(stored.join("marker.txt")).unwrap(),
+        "account-b",
+        "b's stored session must still be in its store"
+    );
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "a refusal before any write is what keeps a collision from stranding a journal"
+    );
+}
+
+#[test]
+fn a_logged_out_code_over_an_empty_live_directory_still_installs_the_incoming_session() {
+    // The carve-out the refusal above must NOT swallow: a live directory with
+    // nothing movable in it holds no session to misfile, which is the
+    // ordinary state of a machine that has never signed in. Refusing here
+    // would break the first switch on every fresh install.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({"locale": "en-GB"}).to_string(),
+    )
+    .unwrap();
+    let stored = tp.desktop_profile_dir("b").join("Network");
+    std::fs::create_dir_all(&stored).unwrap();
+    std::fs::write(stored.join("marker.txt"), "account-b").unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), None, "b").unwrap();
+
+    assert_eq!(out, DesktopOutcome::Switched);
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-b"
+    );
+    assert!(
+        !tp.desktop_profile_dir("a").exists(),
+        "there was no session to park, so nothing may have been filed"
+    );
+}
+
+#[test]
+fn a_non_string_account_uuid_is_refused_rather_than_filed_under_the_clis_name() {
+    // `lastKnownAccountUuid` is another application's field and byte does not
+    // own its type. A number carries no identity byte can read, which is a
+    // different fact from there being none: reading it as "absent" would file
+    // this session under whichever account the CLI happened to name.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let dir = dp.desktop_dir().join("Network");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker.txt"), "account-a").unwrap();
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({"lastKnownAccountUuid": 7, "locale": "en-GB"}).to_string(),
+    )
+    .unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b").unwrap();
+
+    assert_eq!(out, DesktopOutcome::IdentityMismatch);
+    assert!(
+        !tp.desktop_profile_dir("a").exists(),
+        "an unreadable identity must not be filed under the outgoing account's uuid"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-a"
+    );
+}
+
+#[test]
+fn an_explicitly_null_account_uuid_carries_no_identity_and_still_parks() {
+    // The other side of the same branch: an explicit JSON `null` is the app
+    // saying there is no session, exactly like omitting the key, and over an
+    // empty store that is parked normally rather than refused.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let dir = dp.desktop_dir().join("Network");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker.txt"), "signed-out").unwrap();
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({"lastKnownAccountUuid": null, "locale": "en-GB"}).to_string(),
+    )
+    .unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b").unwrap();
+
+    assert_eq!(out, DesktopOutcome::NoProfileForIncoming);
+    assert_eq!(
+        std::fs::read_to_string(tp.desktop_profile_dir("a").join("Network/marker.txt")).unwrap(),
+        "signed-out"
+    );
+}
+
+#[test]
+fn a_traversing_account_uuid_from_the_apps_config_never_redirects_the_park() {
+    // With `outgoing: None` the park target comes from ANOTHER application's
+    // `config.json`, not from byte's own `accounts.json`. `Path::join` treats
+    // `..` as traversal (and an absolute component as a replacement), so an
+    // unsanitised value would redirect the park -- and the journal's recorded
+    // `to` paths -- clean out of the profile store.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let dir = dp.desktop_dir().join("Network");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker.txt"), "account-a").unwrap();
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({
+            "lastKnownAccountUuid": "../escape",
+            "oauth:tokenCacheV2": {"accessToken": "a-token"},
+            "locale": "en-GB"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), None, "b").unwrap();
+
+    assert_eq!(out, DesktopOutcome::IdentityMismatch);
+    assert!(
+        !tp.byte_config_dir().join("escape").exists(),
+        "the park must never land outside the profile store"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-a",
+        "and a refusal moves nothing"
+    );
+    assert!(!tp.desktop_journal_file().exists());
 }

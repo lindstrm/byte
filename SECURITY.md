@@ -66,6 +66,8 @@ one, and only the third has the OS credential store's protection:
    owner-only on Unix (mode `0700`); on Windows it inherits the config
    directory's permissions rather than getting an explicit owner-only ACL,
    because setting one needs a Win32 dependency byte does not carry.
+   `byte remove` deletes this directory along with the account's other two
+   copies; see below.
 
 Locations 1, 2 and 3 are on equal footing: they rely on the same OS-level
 protections, and none adds encryption beyond what the platform already
@@ -88,12 +90,23 @@ If your threat model includes a local attacker able to run arbitrary code as
 you, the correct response to a suspected compromise is the same regardless
 of which copy was read: revoke the affected account's session from your
 claude.ai account settings. `byte remove <name>` deletes byte's copy of the
-credential from the OS credential store and its metadata entry, but it does
-**not** clear that account's parked desktop profile in `desktop/`, nor its
-past backups in `backups/` — those age out only
-through the normal ten-generation pruning — and neither `byte remove` nor
-deleting `~/.claude/.credentials.json` revokes the token itself — only
-Anthropic's auth servers can do that.
+credential from the OS credential store, its metadata entry, and that
+account's parked desktop profile in `desktop/` (locations 3 and 5) — the
+prompt names the desktop session explicitly when there is one, since it is a
+signed-in claude.ai session rather than a token. Two things it does not do:
+it does not clear that account's past backups in `backups/`, which age out
+only through the normal ten-generation pruning; and it does not revoke
+anything. Neither `byte remove` nor deleting
+`~/.claude/.credentials.json` invalidates a token or a session — only
+Anthropic's auth servers can do that, so a removal is byte forgetting a
+credential, never the credential ceasing to work.
+
+If the desktop profile cannot be deleted — most often a file inside it still
+held open by another process on Windows — `byte remove` says so and names
+the directory, rather than failing a removal that has already taken the
+keychain entry and the metadata row with it. That warning means location 5
+is still on disk for an account byte can no longer reach, and the directory
+has to be deleted by hand.
 
 `accounts.json`, byte's own metadata file, holds each stored account's
 profile: email, organization name, billing type, organization role,

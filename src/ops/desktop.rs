@@ -41,7 +41,7 @@ pub enum DesktopOutcome {
 enum ParkTarget {
     /// File it under this uuid.
     Under(String),
-    /// There is no session to file.
+    /// There is no session to file: nothing in the live directory moves.
     Nothing,
     /// byte cannot tell whose session this is, or it is not the one it was
     /// told to expect. Touch nothing.
@@ -60,10 +60,10 @@ enum ParkTarget {
 /// applies its identity. Nothing on disk changes on a refusal: it costs
 /// nothing and loses nothing.
 ///
-/// Two cases are worth spelling out, because each was a finding.
+/// Three cases are worth spelling out, because each was a finding.
 ///
 /// `outgoing` is `None` -- Claude Code is logged out, or freshly installed
-/// -- but `config.json` names an account. Reading that as "no session to
+/// -- but `config.json` NAMES an account. Reading that as "no session to
 /// park" plans no park at all, leaves the live directory's contents in
 /// place, and lands the incoming account's install moves on top of them:
 /// where the entry sets overlap the rename fails with a bare io error, and
@@ -71,15 +71,26 @@ enum ParkTarget {
 /// identity over a directory still holding the previous account's cookies.
 /// The app itself knows whose session it is; byte parks it under that uuid.
 ///
-/// An ABSENT `lastKnownAccountUuid` used to be waved through unconditionally
-/// on the premise that a signed-out profile is harmless to file under the
-/// outgoing account. That premise holds only while `<store>/<outgoing>` is
-/// empty -- and byte manufactures the violating state itself: `config::clear`
-/// removes `lastKnownAccountUuid` at the very moment the park fills that
-/// directory with a real profile. Over a store that already holds a session,
-/// an absent uuid is a drift signal, not a green light.
+/// `outgoing` is `None` and `config.json` names NOBODY, over a live
+/// directory that nonetheless holds a session. Same two failures, and
+/// nothing to file the session under, so the only safe answer is to refuse.
+/// byte manufactures this precondition itself: the `Absent`/`Unreadable`
+/// install arms below call `config::clear`, which removes
+/// `lastKnownAccountUuid` while the live directory holds the account's real
+/// cookies -- and a tray click then switches Claude Code without touching
+/// the desktop app at all. `Nothing` survives only for a live directory with
+/// nothing movable in it, which is the ordinary state of a machine that has
+/// never signed in and must keep working.
+///
+/// An ABSENT `lastKnownAccountUuid` alongside an outgoing account used to be
+/// waved through unconditionally, on the premise that a signed-out profile
+/// is harmless to file under it. That premise holds only while
+/// `<store>/<outgoing>` is empty -- and the same `config::clear` violates
+/// it. Over a store that already holds a session, an absent uuid is a drift
+/// signal, not a green light.
 fn park_target(
     paths: &impl HostPaths,
+    live_dir: &Path,
     outgoing: Option<&str>,
     live: &config::DesktopOauth,
 ) -> Result<ParkTarget> {
@@ -87,14 +98,23 @@ fn park_target(
 
     let Some(expected) = outgoing else {
         return Ok(match identity {
-            config::Identity::Absent => ParkTarget::Nothing,
-            config::Identity::Account(uuid) => ParkTarget::Under(uuid),
+            config::Identity::Account(uuid) => park_under(uuid),
             config::Identity::Unreadable => ParkTarget::Refuse,
+            // Neither half names an account. With nothing to file a session
+            // under, "there is no session" has to be established from the
+            // live directory rather than assumed.
+            config::Identity::Absent => {
+                if profile::movable_entries(live_dir)?.is_empty() {
+                    ParkTarget::Nothing
+                } else {
+                    ParkTarget::Refuse
+                }
+            }
         });
     };
 
     Ok(match identity {
-        config::Identity::Account(uuid) if uuid == expected => ParkTarget::Under(uuid),
+        config::Identity::Account(uuid) if uuid == expected => park_under(uuid),
         config::Identity::Account(_) | config::Identity::Unreadable => ParkTarget::Refuse,
         // No identity: a desktop app that has never been signed in, or one
         // byte itself signed out. Only the first is safe to file, and an
@@ -104,12 +124,31 @@ fn park_target(
         config::Identity::Absent => {
             let stored = profile::movable_entries(&paths.desktop_profile_dir(expected))?;
             if stored.is_empty() {
-                ParkTarget::Under(expected.to_string())
+                park_under(expected.to_string())
             } else {
                 ParkTarget::Refuse
             }
         }
     })
+}
+
+/// `Under(uuid)`, unless that string cannot safely name a directory.
+///
+/// Every `Under` in [`park_target`] goes through here rather than only the
+/// one reached with `outgoing: None`, even though that is the arm where the
+/// value provably comes from another application's `config.json`: the same
+/// string ends up in `HostPaths::desktop_profile_dir`, in the journal's
+/// recorded `to` paths, and in the `desktop_profile` record, and there is no
+/// arm where letting it steer a path would be correct. See
+/// [`crate::paths::is_profile_store_component`] for what an unchecked value
+/// does. `Refuse` is already the answer for "byte cannot tell whose session
+/// this is", and an identifier it cannot use is a case of exactly that.
+fn park_under(uuid: String) -> ParkTarget {
+    if crate::paths::is_profile_store_component(&uuid) {
+        ParkTarget::Under(uuid)
+    } else {
+        ParkTarget::Refuse
+    }
 }
 
 /// Does an account's store already hold a desktop session?
@@ -234,7 +273,7 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
     // guard the write below, and as the content of that write.
     let live_oauth = config::capture(&desktop.config_file())?;
 
-    let park_under = match park_target(paths, outgoing, &live_oauth)? {
+    let park_under = match park_target(paths, &live, outgoing, &live_oauth)? {
         ParkTarget::Refuse => return Ok(DesktopOutcome::IdentityMismatch),
         ParkTarget::Nothing => None,
         ParkTarget::Under(uuid) => Some(uuid),

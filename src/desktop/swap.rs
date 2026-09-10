@@ -326,9 +326,12 @@ pub enum IdentityRepair {
     /// reversal `config.json` was left exactly as it was, since it still
     /// describes the session being restored.
     Unreadable(PathBuf),
-    /// No desktop paths were available, so `config.json` was never reached.
-    /// The journal is deliberately left on disk: only a later command, one
-    /// that can locate the app, is able to finish this.
+    /// No desktop paths were available, so `config.json` was never reached
+    /// -- and there was identity work that needed it. The journal is
+    /// deliberately left on disk: only a later command, one that can locate
+    /// the app, is able to finish this. A repair with provably no identity
+    /// work reports `NotNeeded` instead, whether or not paths were
+    /// available; see `restore_identity`.
     Deferred,
 }
 
@@ -348,31 +351,47 @@ pub enum IdentityRepair {
 /// never hold the incoming account's keys, so there is no blend to break up
 /// -- and clearing a file that legitimately describes the session being
 /// restored would sign the user out for no reason.
+///
+/// Which is also why a reversal naming no outgoing account is `NotNeeded`
+/// rather than work: there is nothing to restore and nothing to clear. That
+/// is decided first, above the `desktop` gate, because it is an answer about
+/// the journal alone.
 fn restore_identity<P: HostPaths, D: DesktopPaths>(
     paths: &P,
     desktop: Option<&D>,
     journal: &Journal,
     recovery: Recovery,
 ) -> Result<IdentityRepair> {
+    let account = match recovery {
+        Recovery::RollForward => journal.incoming.as_deref(),
+        Recovery::Reverse => journal.outgoing.as_deref(),
+    };
+
+    // Settled BEFORE the desktop gate below, deliberately. A reversal with no
+    // outgoing account has no identity work in it at all -- there is no
+    // account whose keys belong in `config.json`, and a reversal never clears
+    // -- so this answer needs no desktop paths and cannot change once they
+    // are available. Deferring it instead would keep a journal recording
+    // nothing outstanding, and `recover_if_interrupted` deliberately never
+    // clears a `Deferred` journal: every later byte command would re-run the
+    // same repair and warn about a swap that was already as finished as it
+    // can be.
+    if account.is_none() && recovery == Recovery::Reverse {
+        return Ok(IdentityRepair::NotNeeded);
+    }
+
     let Some(desktop) = desktop else {
         return Ok(IdentityRepair::Deferred);
     };
     let config_file = desktop.config_file();
     let backups = paths.backup_dir();
 
-    let account = match recovery {
-        Recovery::RollForward => journal.incoming.as_deref(),
-        Recovery::Reverse => journal.outgoing.as_deref(),
-    };
-
     let signed_out = config::DesktopOauth::default();
 
     let Some(account) = account else {
-        if recovery == Recovery::Reverse {
-            return Ok(IdentityRepair::NotNeeded);
-        }
-        // Nothing was being installed, so the swap's own ending is a
-        // signed-out app waiting for a login to capture.
+        // Roll-forward only, by the check above. Nothing was being
+        // installed, so the swap's own ending is a signed-out app waiting
+        // for a login to capture.
         config::apply_if_changed(&config_file, &signed_out, &backups)?;
         return Ok(IdentityRepair::Restored);
     };

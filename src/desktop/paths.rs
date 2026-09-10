@@ -20,6 +20,27 @@ pub trait DesktopPaths: Send + Sync {
     fn config_file(&self) -> PathBuf {
         self.desktop_dir().join("config.json")
     }
+
+    /// Is the app actually here, as opposed to merely locatable?
+    ///
+    /// [`RealDesktopPaths::discover`] answers "where WOULD Claude Desktop
+    /// keep its data", and it succeeds whenever `%APPDATA%` is set -- which
+    /// it is for every interactive Windows user, installed app or not.
+    /// Acting on that alone makes byte manufacture state for an application
+    /// that is not there: a junk `oauth.json` of nulls in its own store, and
+    /// -- through `config::clear` -> `JsonDocument::save` ->
+    /// `atomic::write`'s `create_dir_all` -- a `%APPDATA%\Claude\config.json`
+    /// holding `{}` for an app that has never run. After that `byte list`
+    /// reports a desktop session that does not exist and every switch prints
+    /// a message about it.
+    ///
+    /// The data directory existing is the strongest signal available without
+    /// probing the registry or an install path byte does not own, and it is
+    /// the same condition every other part of the desktop half needs anyway:
+    /// there is nothing to park out of a directory that is not there.
+    fn is_installed(&self) -> bool {
+        self.desktop_dir().is_dir()
+    }
 }
 
 impl<T: DesktopPaths + ?Sized> DesktopPaths for &T {
@@ -83,14 +104,26 @@ pub struct TestDesktopPaths {
 
 impl TestDesktopPaths {
     pub fn new() -> Result<Self> {
+        let this = Self::uninstalled()?;
+        let d = this.desktop_dir();
+        std::fs::create_dir_all(&d).map_err(|source| Error::Io { path: d, source })?;
+        Ok(this)
+    }
+
+    /// Paths that resolve, over a machine where the app is not installed.
+    ///
+    /// The distinction [`DesktopPaths::is_installed`] exists for, and
+    /// otherwise untestable: [`new`](Self::new) always creates its
+    /// directory, so every other test in this crate describes a machine that
+    /// HAS Claude Desktop. On Windows `discover()` succeeds on every machine,
+    /// so this is not an exotic state -- it is what byte sees on any Windows
+    /// box without the app.
+    pub fn uninstalled() -> Result<Self> {
         let dir = tempfile::tempdir().map_err(|source| Error::Io {
             path: PathBuf::from("<tempdir>"),
             source,
         })?;
-        let this = Self { dir };
-        let d = this.desktop_dir();
-        std::fs::create_dir_all(&d).map_err(|source| Error::Io { path: d, source })?;
-        Ok(this)
+        Ok(Self { dir })
     }
 
     pub fn root(&self) -> &Path {

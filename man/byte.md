@@ -70,10 +70,13 @@ instead of starting anything.
   opens a terminal running this command, and relies on that prompt.
 
 **remove** *NAME* \[**--yes**]
-: Forget a stored account, deleting both its metadata and its stored
-  credentials. Unlike every other write byte performs, this has no backup and
-  cannot be undone. Prompts for confirmation when standard input is a
-  terminal and **--json** is not set; otherwise **--yes** is required.
+: Forget a stored account, deleting its metadata, its stored credentials, and
+  its parked Claude desktop session in *&lt;byte config dir&gt;/desktop/*.
+  Unlike every other write byte performs, none of this has a backup and it
+  cannot be undone; deleting byte's copies is also not the same as revoking
+  them, which only claude.ai can do. Prompts for confirmation when standard
+  input is a terminal and **--json** is not set — naming the desktop session
+  when there is one — otherwise **--yes** is required.
 
 **rename** *NAME* *LABEL*
 : Change an account's display label.

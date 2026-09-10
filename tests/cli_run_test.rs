@@ -17,13 +17,14 @@ use byte::claude::detect::FakeProbe;
 use byte::claude::files::ClaudeFiles;
 use byte::claude::snapshot::SCHEMA_VERSION;
 use byte::cli::run::{
-    cmd_add, cmd_switch, format_size, recover_under_lock, repair_message, resolve_add_failure,
-    running_sessions_warning, switch_json,
+    cmd_add, cmd_switch, desktop_paths_if_installed, format_size, recover_under_lock,
+    remove_prompt, repair_message, resolve_add_failure, running_sessions_warning, switch_json,
 };
 use byte::desktop::paths::{DesktopPaths, TestDesktopPaths};
 use byte::desktop::swap::{IdentityRepair, Recovery, Repair};
 use byte::lock::MutationGuard;
 use byte::ops::desktop::DesktopOutcome;
+use byte::ops::manage;
 use byte::ops::switch::{SwitchOutcome, Switcher, SyncOutcome};
 use byte::paths::{HostPaths, TestPaths};
 use byte::store::metadata::AccountMeta;
@@ -461,6 +462,111 @@ fn cmd_switch_skips_the_desktop_half_when_no_desktop_paths_are_available() {
 }
 
 #[test]
+fn a_machine_without_claude_desktop_installed_has_no_state_manufactured_for_it() {
+    // `RealDesktopPaths::discover()` succeeds whenever `%APPDATA%` is set,
+    // which is every interactive Windows user -- installed app or not. Acting
+    // on that alone made `byte switch` create `%APPDATA%\Claude\config.json`
+    // holding `{}` for an application that has never run (via
+    // `config::clear` -> `JsonDocument::save` -> `atomic::write`'s
+    // `create_dir_all`), park a junk all-nulls `oauth.json` for the outgoing
+    // account, stamp a `desktop_profile` record so `byte list` reported a
+    // desktop session that does not exist, and print a message on every
+    // switch -- while `docs/troubleshooting.md` promised silence.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::uninstalled().unwrap();
+    login_as(&tp, "u1", "a@example.com", "r1");
+    let sw = Switcher::new(&tp, MemoryStore::new());
+    sw.capture_current().unwrap();
+    login_as(&tp, "u2", "b@example.com", "r2");
+    sw.capture_current().unwrap();
+
+    let desktop = desktop_paths_if_installed(Some(&dp));
+    assert!(
+        desktop.is_none(),
+        "a directory that is not there is not an installed app"
+    );
+
+    cmd_switch(
+        &sw,
+        "a@example.com",
+        false,
+        &FakeProbe::with_count(0),
+        desktop,
+    )
+    .unwrap();
+
+    assert!(
+        !dp.desktop_dir().exists(),
+        "byte must not create the desktop app's data directory for an app that is not installed"
+    );
+    assert!(
+        !tp.desktop_store_dir().exists(),
+        "nor a profile store for a desktop session that cannot exist"
+    );
+    let listing = manage::list(&sw).unwrap();
+    assert!(
+        listing.iter().all(|l| l.meta.desktop_profile.is_none()),
+        "and `byte list` must not report a stored desktop session either"
+    );
+}
+
+#[test]
+fn an_installed_claude_desktop_is_not_gated_away() {
+    // The other half: the gate must only exclude a machine where the app's
+    // data directory is genuinely absent, or it would silently disable the
+    // whole desktop half.
+    let dp = TestDesktopPaths::new().unwrap();
+    assert!(desktop_paths_if_installed(Some(&dp)).is_some());
+    let nothing: Option<&TestDesktopPaths> = None;
+    assert!(desktop_paths_if_installed(nothing).is_none());
+}
+
+#[test]
+fn switch_json_reports_an_uninstalled_desktop_app_as_null() {
+    // The documented `--json` contract for this case: `desktop` is `null`,
+    // exactly as for a no-op switch, and the key is still present so a
+    // script can tell it from an older byte that never emitted the field.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::uninstalled().unwrap();
+    login_as(&tp, "u1", "a@example.com", "r1");
+    let sw = Switcher::new(&tp, MemoryStore::new());
+    sw.capture_current().unwrap();
+    login_as(&tp, "u2", "b@example.com", "r2");
+    sw.capture_current().unwrap();
+
+    let outcome = sw.switch_to("a@example.com").unwrap();
+    let value = switch_json(&outcome, None);
+
+    assert!(desktop_paths_if_installed(Some(&dp)).is_none());
+    assert!(value.get("desktop").is_some());
+    assert_eq!(value["desktop"], serde_json::Value::Null);
+}
+
+#[test]
+fn remove_names_the_desktop_session_only_when_there_is_one() {
+    // `byte remove` deletes the parked desktop profile as well, and that is
+    // the most consequential thing it destroys -- a live claude.ai session as
+    // plain files. A prompt that leaves it inside "its stored credentials"
+    // is asking for consent the user has not knowingly given.
+    let with = remove_prompt("work", true);
+    assert!(
+        with.contains("Claude Desktop session"),
+        "the session has to be named when one exists: {with}"
+    );
+    assert!(with.contains("cannot be recovered afterward"));
+
+    let without = remove_prompt("work", false);
+    assert!(
+        !without.contains("Claude Desktop"),
+        "and must not be mentioned when there is none: {without}"
+    );
+    assert_eq!(
+        without,
+        "Remove 'work'? Its stored credentials cannot be recovered afterward."
+    );
+}
+
+#[test]
 fn cmd_switch_moves_the_desktop_profile_in_json_mode_too() {
     // Review finding: `--json` used to return before the desktop block was
     // reached, so a script driving `byte switch --json` was left with Claude
@@ -657,6 +763,32 @@ fn a_repair_with_an_unreadable_saved_sign_in_names_the_file() {
 }
 
 #[test]
+fn a_reversal_with_an_unreadable_saved_sign_in_does_not_predict_a_signed_out_app() {
+    // The same `IdentityRepair` means opposite things in the two directions,
+    // and `restore_identity` says so: a roll-forward CLEARS the app's account
+    // keys rather than leave the outgoing account's over the incoming
+    // account's cookies, so the app really does open signed out. A reversal
+    // writes nothing at all -- `config.json` still describes the very session
+    // the reversal just put back -- so the app opens as that account and
+    // telling the user otherwise sends them to sign in over a working
+    // session.
+    let msg = repair_message(&Repair {
+        recovery: Recovery::Reverse,
+        identity: IdentityRepair::Unreadable(PathBuf::from("/store/u1/oauth.json")),
+    });
+
+    assert!(
+        msg.contains("oauth.json"),
+        "the file the user has to look at must still be named: {msg}"
+    );
+    assert!(
+        !msg.contains("signed out"),
+        "a reversal left config.json describing the restored session, so the app opens as that \
+         account: {msg}"
+    );
+}
+
+#[test]
 fn switch_json_reports_a_failed_desktop_half() {
     // A desktop failure never fails the command, so the payload is the only
     // machine-readable place it can appear. The error's own text is
@@ -815,9 +947,19 @@ fn recovery_still_runs_when_the_lock_is_free() {
 fn format_size_reports_bytes_plainly_under_a_kilobyte() {
     assert_eq!(format_size(0), "0 B");
     assert_eq!(format_size(512), "512 B");
+    // The exact boundary, from below: one byte short of a kilobyte is still
+    // a plain byte count, with no decimal point.
+    assert_eq!(format_size(1023), "1023 B");
 }
 
 #[test]
 fn format_size_reports_larger_sizes_with_one_decimal_and_a_unit() {
+    // Every unit the table carries gets named, in order. Without the
+    // kilobyte case a table whose second entry was wrong -- or missing
+    // entirely -- would still satisfy the megabyte assertion below.
+    assert_eq!(format_size(1024), "1.0 KB");
+    assert_eq!(format_size(1536), "1.5 KB");
     assert_eq!(format_size(2 * 1024 * 1024), "2.0 MB");
+    assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+    assert_eq!(format_size(4 * 1024 * 1024 * 1024 * 1024), "4.0 TB");
 }

@@ -41,6 +41,40 @@ fn test_paths_are_rooted_in_a_temp_directory_that_exists() {
 }
 
 #[test]
+fn a_resolvable_location_is_not_the_same_fact_as_an_installed_app() {
+    // `discover()` answers "where WOULD the app keep its data", and on
+    // Windows that succeeds for every interactive user whether or not Claude
+    // Desktop was ever installed. `is_installed` is the separate question,
+    // and the one every caller of the desktop half actually needs: without
+    // it byte writes a `config.json` into `%APPDATA%\Claude` for an
+    // application that has never run.
+    let absent = TestDesktopPaths::uninstalled().unwrap();
+    assert!(
+        !absent.desktop_dir().exists(),
+        "the fixture must model a machine without the app"
+    );
+    assert!(!absent.is_installed());
+    assert_eq!(
+        absent.config_file(),
+        absent.desktop_dir().join("config.json"),
+        "the paths still resolve; only the app is missing"
+    );
+
+    assert!(TestDesktopPaths::new().unwrap().is_installed());
+}
+
+#[test]
+fn a_file_where_the_desktop_directory_should_be_is_not_an_installed_app() {
+    // `is_dir`, not `exists`: a plain file at that path is not a data
+    // directory, and treating it as one would send every later operation
+    // into an io error instead of the silent skip.
+    let p = TestDesktopPaths::uninstalled().unwrap();
+    std::fs::write(p.desktop_dir(), b"not a directory").unwrap();
+
+    assert!(!p.is_installed());
+}
+
+#[test]
 fn the_profile_store_and_journal_live_under_bytes_config_dir() {
     // Parked profiles are byte's own state, not the app's, so they belong
     // beside accounts.json rather than inside %APPDATA%\Claude.

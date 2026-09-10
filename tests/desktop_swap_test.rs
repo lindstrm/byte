@@ -925,6 +925,55 @@ fn a_repair_that_cannot_reach_the_config_keeps_the_journal_and_says_so() {
 }
 
 #[test]
+fn a_reversal_with_no_account_to_restore_is_finished_without_desktop_paths() {
+    // `Deferred` exists for a repair whose identity half is genuinely
+    // outstanding, and it deliberately KEEPS the journal -- so every later
+    // byte command warns about a swap that is still unfinished. A reversal
+    // whose journal names no outgoing account has no identity work at all:
+    // given desktop paths it would answer `NotNeeded` and clear the journal,
+    // so answering `Deferred` without them keeps a record of nothing and
+    // warns forever. The determination needs no desktop paths, so it must
+    // not sit behind them.
+    let tp = TestPaths::new().unwrap();
+    let live = tp.root().join("Claude");
+    let store = tp.desktop_profile_dir("uuid-b");
+    // An install-only journal, which is what `outgoing: None` produces: a
+    // swap that parks nothing because there was nothing to park. Its one
+    // move has not run, so both ends are still occupied -- the resting state
+    // of every install throughout the park stage.
+    seed(&live, &[("Network", "account-live")]);
+    seed(&store, &[("Network", "account-b")]);
+    let mut j = Journal::plan(&live, None, Some(&store)).unwrap();
+    j.incoming = Some("uuid-b".to_string());
+    assert_eq!(
+        j.outgoing, None,
+        "the shape under test names no park target"
+    );
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let repair = recover_if_interrupted(&tp, None::<&TestDesktopPaths>)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(repair.recovery, Recovery::Reverse);
+    assert_eq!(
+        repair.identity,
+        IdentityRepair::NotNeeded,
+        "a reversal with no account to restore has nothing to defer"
+    );
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "a repair with nothing outstanding must not keep a journal for later commands to warn about"
+    );
+    assert_eq!(
+        marker(&live.join("Network")).as_deref(),
+        Some("account-live")
+    );
+    assert_eq!(marker(&store.join("Network")).as_deref(), Some("account-b"));
+}
+
+#[test]
 fn a_forward_move_with_neither_end_present_is_an_error() {
     // `apply_move` classifies the pair (source present, destination present)
     // before renaming, and only the exact "source gone, destination there"

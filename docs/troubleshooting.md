@@ -27,7 +27,7 @@ what's quoted here.
 | applying the account snapshot failed, and rolling back `<path>` afterwards also failed | The rarest failure: writing the credentials file or the config-file half of a switch failed, and restoring the credentials file to its pre-switch state *also* failed. The two files may now disagree about which account is active. | Follow "Recovering from a backup" below for both `.claude.json` and `.credentials.json`, then confirm with `claude` and `byte current` that they agree. |
 | `timed out after N seconds waiting for a new login` (`byte add`) | Nobody logged in as a different account within the timeout. | Retry `byte add`, optionally with a longer `--timeout`, and log in via `claude` promptly. |
 | `byte add needs confirmation; re-run with --yes to proceed without prompting` | `byte add` logs Claude Code out before it starts waiting for a new login, so it refuses to do that unattended: standard input isn't a terminal (a script, cron, or CI), or `--json` is set (a prompt would corrupt machine-readable output). Nothing was logged out — the check runs before the logout, not after it. | Re-run with `--yes` if you're sure, or run it interactively without `--json` to be prompted instead. |
-| `byte remove needs confirmation; re-run with --yes to proceed without prompting` | `byte remove` deletes a keychain entry with no backup, so it refuses to run unattended: standard input isn't a terminal (a script, cron, or CI), or `--json` is set (a prompt would corrupt machine-readable output). | Re-run with `--yes` if you're sure, or run it interactively without `--json` to be prompted instead. |
+| `byte remove needs confirmation; re-run with --yes to proceed without prompting` | `byte remove` deletes a keychain entry with no backup, and the account's parked Claude Desktop session with it, so it refuses to run unattended: standard input isn't a terminal (a script, cron, or CI), or `--json` is set (a prompt would corrupt machine-readable output). | Re-run with `--yes` if you're sure, or run it interactively without `--json` to be prompted instead. |
 | `another byte process is currently changing accounts...` | Another byte process — often the tray — already holds the mutation lock (`mutation.lock` in byte's config directory) because it's mid-switch, mid-capture, or mid-add/remove/rename. byte refused to start a second write sequence rather than risk two processes interleaving writes to the same files. Nothing was read or changed. | Wait for the other process to finish, then retry. Usually that is instant — but a `byte add` waiting for its new login holds the lock for as long as it waits (up to `--timeout`, 300 seconds by default), and the tray reports Busy for that whole window. The lock is an OS-level advisory lock tied to that process's open file handle, so it is always released automatically if that process exits or crashes — there is no lock file to delete by hand. |
 | `a desktop profile swap was interrupted and could not be repaired automatically` | byte was interrupted while moving the Claude desktop app's session between accounts. The journal recording that swap is either unreadable, was written by a newer version of byte, or — if this appears right as a switch starts — is simply still sitting on disk from that earlier interruption; byte refuses to start a new swap on top of one that was never repaired, since that would destroy the only record of it while its files may already be half-moved. That refusal is checked before byte writes anything at all, so a switch refused this way changed nothing. Your session data is still on disk — nothing is deleted by a swap, only moved. This never exits non-zero by itself: automatic recovery at the start of every command catches this exact failure and prints it as a warning (`an earlier desktop profile swap could not be repaired automatically, so this command is continuing without touching it: ...`) rather than blocking the command you actually ran, and `byte switch` catches it the same way (see the desktop-switch bullet below) rather than undoing a Claude Code switch that already committed. | Do not delete the journal. Upgrade byte if the message says the format is newer. If it says an earlier swap was never repaired, run any byte command (recovery runs automatically at the start of every command, e.g. `byte list`) and then retry. Otherwise the journal lists every `from`/`to` pair byte intended, so the move can be completed or reversed by hand. |
 
@@ -61,17 +61,19 @@ A few behaviors worth calling out even though they aren't errors:
     account has no captured desktop profile yet (it has never been the
     outgoing side of a switch while signed in to Claude Desktop). Sign in
     once and the next switch away from it captures one.
-  - **`Claude's desktop app is signed in as a different account than byte
-    expected there, so its session was left alone rather than filed under
-    the wrong account -- nothing changed. If it's already showing the
-    account you just switched to, there is nothing more to do. Otherwise,
-    sign out of Claude Desktop and sign in again there as the account you
-    want; byte will capture that session the next time you switch away from
-    it.`** — `config.json`'s `lastKnownAccountUuid` names a different
-    account than the one byte was about to park the live session under. The
-    two halves have drifted apart: byte's tray switches Claude Code without
-    touching the desktop app at all, and you can sign into Claude Desktop by
-    hand at any time.
+  - **`Claude's desktop app is not signed in as the account byte expected
+    there, so its session was left alone rather than filed under the wrong
+    account -- nothing changed. If it's already showing the account you just
+    switched to, there is nothing more to do. Otherwise, sign out of Claude
+    Desktop and sign in again there as the account you want; byte will
+    capture that session the next time you switch away from it.`** — in the
+    commonest case, `config.json`'s `lastKnownAccountUuid` names a different
+    account than the one byte was about to park the live session under (the
+    list further down covers the other ways to reach the same refusal, where
+    the app names no account byte can use at all). The two halves have
+    drifted apart: byte's tray switches Claude Code without touching the
+    desktop app at all, and you can sign into Claude Desktop by hand at any
+    time.
 
     The most common way to reach this message is exactly that drift: a tray
     click switches Claude Code to a new account while the desktop app stays
@@ -97,7 +99,7 @@ A few behaviors worth calling out even though they aren't errors:
     produced it. Nothing on disk was changed — the Claude Code switch itself
     still happened.
 
-    Three further states reach the same refusal, all of them "byte cannot
+    Five further states reach the same refusal, all of them "byte cannot
     tell whose session this is":
 
     - **A signed-out app (no `lastKnownAccountUuid` at all) over a store
@@ -113,8 +115,28 @@ A few behaviors worth calling out even though they aren't errors:
     - **A signed-out app whose stored profile holds saved keys but no
       directories.** Same protection, one level down: the refusal is on the
       write that would replace those keys, not just on the directories.
+    - **A signed-out app while Claude Code is *also* logged out, over a
+      desktop directory that still holds a session.** Neither half names an
+      account, so there is nothing to file the live session under — and
+      leaving it in place while the incoming account's profile is installed
+      beside it is exactly the blend the refusal exists to prevent. This is
+      not an exotic state: byte itself clears `lastKnownAccountUuid`
+      whenever it restores a profile that has no saved sign-in stored with
+      it, and a tray click switches Claude Code without touching the desktop
+      app at all. A desktop directory with nothing session-bearing in it is
+      *not* refused — that is a machine that has never signed in, and its
+      first switch still works. Sign in to Claude Desktop as the account you
+      want, or log in to Claude Code first so byte knows which account it is
+      switching away from.
     - **A `lastKnownAccountUuid` that is not a string.** byte will not guess
       whose session it is looking at.
+    - **A `lastKnownAccountUuid` that could not be a directory name** —
+      empty, `.`, `..`, or containing `/`, `\`, `:` or a NUL. byte files
+      parked profiles in one directory per account, named by that value, and
+      a value like `../elsewhere` would put the parked session outside the
+      profile store entirely. Nothing on your machine writes such a value;
+      byte checks because `config.json` belongs to another application and
+      byte does not own what goes into it.
   - **`the desktop session for this account was restored, but its saved
     sign-in at <path> could not be read (...), so Claude Desktop will open
     signed out. Sign in there once and byte will capture it again.`**,
@@ -148,10 +170,25 @@ A few behaviors worth calling out even though they aren't errors:
     step. Do not delete the journal; fix the underlying problem and run any
     byte command.
 
-  On a machine with no `%APPDATA%\Claude` at all — every non-Windows
-  platform today, unless `CLAUDE_DESKTOP_DIR` is set — none of the above
-  appears; the desktop half is silently skipped rather than warning on every
-  single switch about a directory that will never exist there.
+    Until that happens, the two halves disagree, and it is worth being
+    explicit about what that means if you open Claude Desktop in the
+    meantime: the profile directories are the **incoming** account's, while
+    `config.json` still holds the **outgoing** account's `oauth:` keys, so
+    the app authenticates as the account you switched *away from* over the
+    account you switched *to*'s cookie jar. What it actually shows in that
+    state is not something byte can predict. Fix the underlying problem and
+    run any byte command before using the app; the recovery is what puts the
+    two back in agreement.
+
+  On a machine with no Claude Desktop data directory at all — every
+  non-Windows platform (unless `CLAUDE_DESKTOP_DIR` is set), and any Windows
+  machine where the desktop app is not installed or has never been run —
+  none of the above appears; the desktop half is silently skipped rather
+  than warning on every single switch about a directory that will never
+  exist there. byte checks for the directory itself, not just for
+  `%APPDATA%`, which is set for every Windows user whether or not Claude
+  Desktop was ever installed: nothing is created under `%APPDATA%\Claude`,
+  no profile is parked, and `byte list` reports no desktop session.
 
   **`byte switch --json` switches the desktop half too**, and answers in the
   payload instead of on stderr: a `desktop` field carrying one lowercase
@@ -161,11 +198,16 @@ A few behaviors worth calling out even though they aren't errors:
   at all — plus `"failed"` when the
   desktop half errored. The field is `null` when the
   desktop half was not attempted at all: switching to the already-active
-  account, or a machine with no `%APPDATA%\Claude`. The key is always
-  present, so `null` is distinguishable from an older byte that never
-  emitted the field. None of the messages above are printed under `--json`,
-  with one exception: a failure's own text still goes to stderr, since the
-  field can only say `"failed"` and stdout is reserved for the payload. A
+  account, or a machine with no Claude Desktop data directory. The key is
+  always present, so `null` is distinguishable from an older byte that never
+  emitted the field. The *advice* messages above — the ones telling you what
+  to do about each outcome — are not printed under `--json`. Warnings that
+  name a specific file or failure still are, on stderr, because the payload
+  has nowhere to put them: a desktop failure's own error text (the field can
+  only say `"failed"`), the `switched_without_identity` warning naming the
+  unreadable `oauth.json` and why it could not be read, and the
+  `accounts.json` bookkeeping warnings above. Everything on **stdout** is
+  still the payload alone, which is what `--json` actually guarantees. A
   desktop failure never fails the command — `byte switch --json` still exits
   zero with a valid JSON object on stdout.
 - **`repaired an interrupted desktop profile swap (RollForward)` /
@@ -185,15 +227,26 @@ A few behaviors worth calling out even though they aren't errors:
   strictly alone — silently, because a concurrent command is ordinary, not a
   fault. Run the command again once the other one finishes if you were
   expecting a repair.
-- **`repaired an interrupted desktop profile swap (...), but the saved
-  sign-in at <path> could not be read, so Claude Desktop may open signed
-  out. Sign in there once and byte will capture it again.`** — the same
-  repair, with its second half done as well as it can be: the directories
-  are where they belong, but the `oauth.json` the swap needed is present and
-  unreadable. byte cleared the app's account keys rather than leave the
-  other account's in place. Sign in to Claude Desktop once. Nothing is left
-  on disk to retry — the journal is cleared, because re-reading the same
-  damaged file would not go differently.
+- **`repaired an interrupted desktop profile swap (RollForward), but the
+  saved sign-in at <path> could not be read, so Claude Desktop may open
+  signed out. Sign in there once and byte will capture it again.`** — the
+  same repair, with its second half done as well as it can be: the
+  directories are where they belong, but the `oauth.json` the swap needed is
+  present and unreadable. byte cleared the app's account keys rather than
+  leave the other account's in place. Sign in to Claude Desktop once.
+  Nothing is left on disk to retry — the journal is cleared, because
+  re-reading the same damaged file would not go differently.
+- **`repaired an interrupted desktop profile swap (Reverse). The saved
+  sign-in at <path> could not be read, but nothing needed it: Claude
+  Desktop's own config already describes the session that was put back, so
+  it will open as that account. byte will capture a fresh saved sign-in the
+  next time you switch away from it.`** — the same unreadable file, in the
+  other direction, where it costs nothing. A reversal restores the session
+  that was *already* live, and the app's `config.json` was never patched
+  away from it, so there is nothing to sign in for and no action to take.
+  This is deliberately not the wording above: an earlier version predicted a
+  signed-out app here too, which would have sent you to sign out of and back
+  into a session that works.
 - **`repaired the directory half of an interrupted desktop profile swap
   (...), but Claude Desktop's own data directory could not be located, so
   which account it is signed in as was left alone. The swap's journal has
@@ -230,6 +283,27 @@ A few behaviors worth calling out even though they aren't errors:
   record under a `desktop_profile` key — `null` for an account that has
   never had one captured, or `{"captured_at": ..., "bytes": ...}` once it
   has.
+- **`byte remove` deletes the account's parked desktop session too**, along
+  with its keychain entry and its `accounts.json` row — the whole of
+  `<byte-config-dir>/desktop/<account-uuid>/`, which holds that account's
+  signed-in claude.ai session and its saved sign-in as plain files. The
+  confirmation prompt names it when there is one to delete (**`Remove
+  '<label>'? Its stored credentials AND its saved Claude Desktop session —
+  that account's signed-in claude.ai session on this machine — are both
+  deleted, and cannot be recovered afterward.`**) and does not mention it
+  otherwise. Deleting byte's copy is not the same as revoking the session:
+  see [Security](../SECURITY.md) for what to do if you need it actually
+  revoked.
+- **`the account was removed, but its stored Claude Desktop session at
+  <path> could not be deleted (...). That directory still holds a live
+  claude.ai session and a saved sign-in for it; delete it by hand.`** — a
+  warning, not a failure. The removal itself has already happened: the
+  keychain entry is gone and `accounts.json` no longer lists the account, so
+  there is nothing to retry and no byte command left that can reach the
+  directory. The usual cause on Windows is a file inside the profile still
+  held open by another process (Claude Desktop itself, an indexer, an
+  antivirus scanner). Quit Claude Desktop and delete the named directory
+  yourself.
 - **Removing the active account** is allowed, once confirmed (see
   `byte remove` above). `byte` stops tracking it as active, but Claude Code
   itself is left logged in as that account's credentials until you run

@@ -102,10 +102,10 @@ credential store does — and so, in plaintext, do the `.credentials.json`
 backups in `backups/` (above): once a refresh token has been live on this
 machine, it persists in one or more backup generations for a while
 afterward, independent of the credential store entry. Removing an account
-with `byte remove` deletes its metadata entry and its credential store
-entry, but does **not** delete its past backups. See
-[Security](../SECURITY.md#threat-model) for the full picture of where
-credentials rest and what removal does and doesn't clear.
+with `byte remove` deletes its metadata entry, its credential store entry,
+and its parked desktop session (below), but does **not** delete its past
+backups. See [Security](../SECURITY.md#threat-model) for the full picture of
+where credentials rest and what removal does and doesn't clear.
 
 ## The desktop profile store
 
@@ -141,3 +141,16 @@ feature itself only runs on Windows, the directory additionally gets an
 explicit owner-only `0700` mode. Treat `desktop/` with at least the same
 care as `backups/` above: anyone who can read your user profile can read
 what is in it.
+
+`byte remove <name>` deletes that account's directory here, and says so in
+its confirmation prompt when there is one to delete. If the delete fails —
+most often a file inside it still held open by another process on Windows —
+the removal has already committed, so byte warns and names the directory
+rather than failing; delete it by hand.
+
+Nothing here is created on a machine where the Claude desktop app is not
+installed. byte decides that from the app's data directory actually being
+there, not from `%APPDATA%` being set, since the latter is true of every
+Windows user: with no `%APPDATA%\Claude`, the desktop half of `byte switch`
+is skipped entirely and neither `desktop/` nor `%APPDATA%\Claude` is
+created.

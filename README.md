@@ -74,7 +74,7 @@ byte switch personal
 | `byte switch <name>` | Switch to a stored account (on Windows, also switches the Claude desktop app's session — see [Desktop app (Windows)](#desktop-app-windows)) |
 | `byte capture` | Save the currently logged-in account |
 | `byte add [--timeout <secs>] [--yes]` | Log out, then save the next account you log in as (default 300s; prompts before logging out unless `--yes` is given) |
-| `byte remove <name> [--yes]` | Forget a stored account (irreversible; prompts for confirmation unless `--yes` is given) |
+| `byte remove <name> [--yes]` | Forget a stored account, including its stored Claude desktop session (irreversible; prompts for confirmation unless `--yes` is given) |
 | `byte rename <name> <label>` | Change an account's display label |
 | `byte autostart enable\|disable\|status` | Opt in (or out) of starting the tray at login |
 
@@ -174,7 +174,10 @@ a secret outside the OS credential store. See
 [Configuration](docs/configuration.md#the-desktop-profile-store) for exactly
 what that means for its permissions (in short: it inherits the config
 directory's own permissions, and is not additionally ACL-restricted on
-Windows).
+Windows). `byte remove` deletes that directory along with the account's
+keychain entry, and says so in its confirmation prompt when there is one to
+delete — but deleting byte's copy is not the same as revoking the session,
+which only claude.ai can do. See [Security](SECURITY.md).
 
 **Unverified.** No automated test exercises the real Claude desktop app —
 they all run against a synthetic directory tree instead, which is the only
@@ -184,8 +187,11 @@ not merely untested-by-CI. See
 [Troubleshooting](docs/troubleshooting.md#desktop-app-switching-is-unverified)
 for exactly what would verify it.
 
-Windows only. On macOS and Linux, `byte switch` behaves exactly as it did
-before this feature existed, with no desktop half attempted.
+Windows only, and only where the app is actually installed. On macOS and
+Linux — and on a Windows machine with no `%APPDATA%\Claude` directory,
+because Claude Desktop was never installed or never run — `byte switch`
+behaves exactly as it did before this feature existed: no desktop half is
+attempted, nothing is created for it, and nothing is reported about it.
 
 ## Configuration
 
