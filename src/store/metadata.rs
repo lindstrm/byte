@@ -54,6 +54,27 @@ pub struct AccountMeta {
     pub credential_schema: u32,
     pub added_at: String,
     pub last_used_at: Option<String>,
+    /// The parked desktop profile, if one has been captured.
+    ///
+    /// `#[serde(default)]` and skipped when absent, deliberately: this is
+    /// purely additive, so it must not bump the accounts schema and must not
+    /// appear in the files of users who never touch the desktop app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_profile: Option<DesktopProfileRecord>,
+}
+
+/// What byte has parked for one account's desktop session.
+///
+/// Absent means never captured, which is what drives the "park the old
+/// profile, leave a fresh one" behaviour on a first switch (design
+/// decision 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopProfileRecord {
+    /// RFC 3339, matching `added_at`.
+    pub captured_at: String,
+    /// Size on disk when captured, for `byte list` and for warning about
+    /// accumulation.
+    pub bytes: u64,
 }
 
 /// The contents of `accounts.json`.
@@ -178,6 +199,15 @@ impl AccountsFile {
                 None => now_rfc3339(),
             },
             last_used_at: existing.and_then(|i| self.accounts[i].last_used_at.clone()),
+            // Carried forward exactly like `last_used_at` above, not reset:
+            // this is stamped by a wholly separate operation (the desktop
+            // swap's `resolve_mut` call, task 8), not by this credential
+            // sync. Resetting it here would mean an ordinary CLI-only
+            // switch -- one that never touches the desktop app at all --
+            // silently erases the record of a profile that is still sitting
+            // on disk, breaking the "absent means never captured" invariant
+            // the whole feature depends on.
+            desktop_profile: existing.and_then(|i| self.accounts[i].desktop_profile.clone()),
         };
 
         match existing {
@@ -224,6 +254,62 @@ impl AccountsFile {
 
         match prefixed.len() {
             1 => Ok(prefixed[0]),
+            0 => Err(Error::NoSuchAccount(query.to_string())),
+            n => Err(Error::AmbiguousAccount {
+                query: query.to_string(),
+                count: n,
+            }),
+        }
+    }
+
+    /// `resolve`'s `&mut` mirror, for a caller that needs to update the
+    /// matched account in place (e.g. stamping a `desktop_profile` record
+    /// after a capture). Matches `resolve`'s lookup semantics exactly --
+    /// same exact-match fields, same ambiguity handling, same uuid/label
+    /// prefix fallback -- expressed over indices rather than collected
+    /// `&AccountMeta` references, since multiple live mutable borrows out of
+    /// `self.accounts` cannot coexist the way `resolve`'s immutable ones do.
+    /// Keep this in sync with `resolve` if its matching rules ever change.
+    pub fn resolve_mut(&mut self, query: &str) -> Result<&mut AccountMeta> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Err(Error::NoSuchAccount(query.to_string()));
+        }
+
+        let exact: Vec<usize> = self
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                a.label.to_lowercase() == q
+                    || a.email.as_deref().map(str::to_lowercase) == Some(q.clone())
+                    || a.uuid.to_lowercase() == q
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        if exact.len() == 1 {
+            return Ok(&mut self.accounts[exact[0]]);
+        }
+        if exact.len() > 1 {
+            return Err(Error::AmbiguousAccount {
+                query: query.to_string(),
+                count: exact.len(),
+            });
+        }
+
+        let prefixed: Vec<usize> = self
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                a.uuid.to_lowercase().starts_with(&q) || a.label.to_lowercase().starts_with(&q)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        match prefixed.len() {
+            1 => Ok(&mut self.accounts[prefixed[0]]),
             0 => Err(Error::NoSuchAccount(query.to_string())),
             n => Err(Error::AmbiguousAccount {
                 query: query.to_string(),

@@ -35,6 +35,7 @@ fn meta(uuid: &str, label: &str) -> AccountMeta {
         credential_schema: SCHEMA_VERSION,
         added_at: "2026-01-01T00:00:00Z".to_string(),
         last_used_at: None,
+        desktop_profile: None,
     }
 }
 

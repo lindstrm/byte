@@ -20,6 +20,7 @@ fn meta(label: &str) -> AccountMeta {
         credential_schema: 1,
         added_at: "2026-01-01T00:00:00Z".into(),
         last_used_at: None,
+        desktop_profile: None,
     }
 }
 

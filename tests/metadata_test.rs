@@ -1,7 +1,7 @@
 use byte::Error;
 use byte::claude::snapshot::AccountSnapshot;
 use byte::paths::{HostPaths, TestPaths};
-use byte::store::metadata::AccountsFile;
+use byte::store::metadata::{AccountsFile, DesktopProfileRecord};
 use serde_json::json;
 
 fn snap(uuid: &str, email: &str) -> AccountSnapshot {
@@ -330,5 +330,112 @@ fn save_prunes_accounts_json_backups_to_the_ten_newest() {
     assert_eq!(
         non_synthetic, 1,
         "expected exactly one non-synthetic (real) backup among the survivors: {remaining:?}"
+    );
+}
+
+#[test]
+fn an_accounts_file_without_desktop_profiles_still_loads() {
+    // Purely additive: an accounts.json written before this feature must
+    // load unchanged, with no schema bump.
+    let tp = TestPaths::new().unwrap();
+    std::fs::write(
+        tp.accounts_file(),
+        serde_json::json!({
+            "schema": 2,
+            "active": null,
+            "accounts": [{
+                "uuid": "u1",
+                "label": "work",
+                "email": "w@example.com",
+                "organization_name": null,
+                "subscription_type": null,
+                "account": {"accountUuid": "u1"},
+                "user_id": null,
+                "credential_schema": 1,
+                "added_at": "2026-01-01T00:00:00Z",
+                "last_used_at": null
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let loaded = AccountsFile::load(&tp.accounts_file()).unwrap();
+    let acct = loaded.resolve("work").unwrap();
+    assert_eq!(acct.label, "work");
+    assert!(acct.desktop_profile.is_none());
+}
+
+#[test]
+fn a_desktop_profile_record_round_trips() {
+    // Uses this file's existing `snap` helper and the real AccountsFile API:
+    // `upsert_from(uuid, &snapshot)`, and `save`/`load` taking paths rather
+    // than a HostPaths.
+    let tp = TestPaths::new().unwrap();
+    let mut file = AccountsFile::default();
+    file.upsert_from("u1", &snap("u1", "w@example.com"));
+    file.resolve_mut("u1").unwrap().desktop_profile = Some(DesktopProfileRecord {
+        captured_at: "2026-09-09T12:00:00Z".to_string(),
+        bytes: 54_000_000,
+    });
+    file.save(&tp.accounts_file(), &tp.backup_dir()).unwrap();
+
+    let back = AccountsFile::load(&tp.accounts_file()).unwrap();
+    let got = back.resolve("u1").unwrap().desktop_profile.clone().unwrap();
+    assert_eq!(got.bytes, 54_000_000);
+    assert_eq!(got.captured_at, "2026-09-09T12:00:00Z");
+}
+
+#[test]
+fn upsert_from_preserves_an_existing_desktop_profile_record() {
+    // desktop_profile is stamped by a completely separate operation (the
+    // desktop swap in task 8's resolve_mut call) from upsert_from (the CLI
+    // sync-back/switch path, task-agnostic and far more frequent). If
+    // upsert_from clobbered it back to None on every ordinary CLI-only
+    // switch, "absent means never captured" (the design's decision-5 signal)
+    // would stop meaning that the moment any unrelated switch touched this
+    // account again -- even though the parked profile is still sitting on
+    // disk, untouched. The record must survive exactly like `added_at` and
+    // `last_used_at` already do above.
+    let mut file = AccountsFile::default();
+    file.upsert_from("u1", &snap("u1", "w@example.com"));
+    file.resolve_mut("u1").unwrap().desktop_profile = Some(DesktopProfileRecord {
+        captured_at: "2026-09-09T12:00:00Z".to_string(),
+        bytes: 54_000_000,
+    });
+
+    // Simulate a later, unrelated sync-back/switch touching the same
+    // account -- e.g. Claude Code rotated its token and byte re-synced.
+    file.upsert_from("u1", &snap("u1", "w@example.com"));
+
+    let record = file
+        .resolve("u1")
+        .unwrap()
+        .desktop_profile
+        .clone()
+        .expect("a later upsert_from must not erase an existing desktop_profile record");
+    assert_eq!(record.bytes, 54_000_000);
+    assert_eq!(record.captured_at, "2026-09-09T12:00:00Z");
+}
+
+#[test]
+fn saved_accounts_json_omits_desktop_profile_key_when_absent() {
+    // skip_serializing_if is what keeps an accounts.json written by this
+    // code indistinguishable, for an account with no desktop profile, from
+    // one written by a byte that predates the field entirely -- so this
+    // must be a literal absence of the "desktop_profile" key, not a present
+    // key holding `null`. A `null` would still deserialize fine today, but
+    // it is not what "never touched the desktop app" is supposed to look
+    // like on disk, and it would make future key-presence checks (e.g. a
+    // hand migration script) see the key where it should see nothing.
+    let tp = TestPaths::new().unwrap();
+    let mut file = AccountsFile::default();
+    file.upsert_from("u1", &snap("u1", "a@example.com"));
+    file.save(&tp.accounts_file(), &tp.backup_dir()).unwrap();
+
+    let text = std::fs::read_to_string(tp.accounts_file()).unwrap();
+    assert!(
+        !text.contains("desktop_profile"),
+        "accounts.json must omit desktop_profile entirely when absent, not write it as null:\n{text}"
     );
 }
