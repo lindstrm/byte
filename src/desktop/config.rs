@@ -5,7 +5,7 @@
 //! updater state, MCP allowlist caches. Moving it between accounts would
 //! drag the user's theme and window layout along with their session.
 //!
-//! Everything here goes through `JsonDocument`, so every byte byte does not
+//! Everything here goes through `JsonDocument`, so every byte it does not
 //! explicitly model survives a capture/apply cycle untouched: key order,
 //! number formatting, and any key a future app version adds.
 
