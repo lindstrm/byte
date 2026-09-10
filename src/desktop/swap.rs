@@ -5,9 +5,11 @@
 //! and so self-segregates -- distinct accounts get distinct directories, and
 //! switching back finds the previous one intact.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::desktop::config;
 use crate::desktop::journal::{Journal, Stage};
+use crate::desktop::paths::DesktopPaths;
 use crate::error::{Error, Result};
 use crate::paths::HostPaths;
 
@@ -49,18 +51,34 @@ pub enum Recovery {
     Reverse,
 }
 
-/// Decide by stage, never by a count.
+/// Decide by stage and by completeness, never by a count.
 ///
 /// One completed `Install` is enough to commit to rolling forward: the
 /// incoming profile is already partly live, and reversing would have to
 /// unpick it while the outgoing profile is only half parked.
+///
+/// A journal whose every move is done rolls forward too, whatever its
+/// stages, because there is nothing left to reverse -- the rename half of
+/// the swap finished. This is not a count: `is_complete` asks whether any
+/// move is outstanding, and one whose rename landed without its `done`
+/// persisting is correctly still outstanding here (`apply_move` is what
+/// reconciles that, from the disk rather than the flag).
+///
+/// The case it exists for is a swap with NO installs at all -- switching
+/// into an account with nothing stored, which parks and then signs the app
+/// out. Such a journal can never satisfy the install test above, so without
+/// this it would reverse: undoing a park that fully completed and putting
+/// the outgoing account's session back, i.e. quietly undoing a switch the
+/// user asked for and that had already happened on disk. That window is
+/// real, not theoretical, because the journal now also covers the
+/// `config.json` patch, and that patch fails on ordinary conditions.
 pub fn recovery_for(journal: &Journal) -> Recovery {
     let any_install_done = journal
         .moves
         .iter()
         .any(|m| m.stage == Stage::Install && m.done);
 
-    if any_install_done {
+    if any_install_done || journal.is_complete() {
         Recovery::RollForward
     } else {
         Recovery::Reverse
@@ -109,7 +127,13 @@ fn write_journal(paths: &impl HostPaths, journal: &Journal) -> Result<()> {
     crate::atomic::write(&file, &bytes)
 }
 
-fn clear_journal(paths: &impl HostPaths) -> Result<()> {
+/// Delete the journal, ending the swap it describes.
+///
+/// `pub` because the swap does not end at the last rename: `config.json`'s
+/// account keys are part of the same commit, and the caller that patches
+/// them is the only one that knows when both halves are done. `execute`
+/// deliberately does NOT call this -- see its own doc comment.
+pub fn clear_journal(paths: &impl HostPaths) -> Result<()> {
     let file = paths.desktop_journal_file();
     match std::fs::remove_file(&file) {
         Ok(()) => Ok(()),
@@ -221,7 +245,7 @@ fn apply_move(
     write_journal(paths, journal)
 }
 
-/// Run a planned swap, recording progress as it goes.
+/// Run a planned swap's renames, recording progress as it goes.
 ///
 /// Precondition: no journal file may already exist at
 /// `paths.desktop_journal_file()`. `recover_if_interrupted` runs at the
@@ -231,6 +255,22 @@ fn apply_move(
 /// record of it while its `from` paths may already have moved. `execute`
 /// enforces the precondition itself, refusing to start, rather than
 /// trusting every future caller to have run recovery first.
+///
+/// RETURNS WITH THE JOURNAL STILL ON DISK, deliberately. The renames are
+/// only part of a swap: the desktop app decides which account it is signed
+/// in as from a handful of keys in its own `config.json`, and until those are
+/// patched the directories on disk belong to one account while the app
+/// authenticates as another. Clearing here would put that patch outside the
+/// commit boundary, and every way it can end -- a crash, or an ordinary
+/// `Err` from the backup copy -- would leave that mixed state with no record
+/// of it for any later command to repair. `ops::desktop::switch_desktop`
+/// calls `clear_journal` once BOTH halves have landed; a patch that fails
+/// leaves the journal for the next command, which finishes it through
+/// `recover_if_interrupted`.
+///
+/// An empty plan still writes a journal, for the same reason: "no directory
+/// moves" does not mean "no work", it means the swap is nothing but the
+/// config patch, and that patch needs a record too.
 pub fn execute(paths: &impl HostPaths, mut journal: Journal) -> Result<()> {
     let file = paths.desktop_journal_file();
     if exists(&file)? {
@@ -245,10 +285,6 @@ pub fn execute(paths: &impl HostPaths, mut journal: Journal) -> Result<()> {
         });
     }
 
-    if journal.moves.is_empty() {
-        return Ok(());
-    }
-
     // The whole plan hits disk BEFORE the first rename. This ordering is the
     // entire point: a journal written afterwards would describe a swap that
     // had already partly happened.
@@ -261,7 +297,103 @@ pub fn execute(paths: &impl HostPaths, mut journal: Journal) -> Result<()> {
         apply_move(paths, &mut journal, index, Direction::Forward)?;
     }
 
-    clear_journal(paths)
+    Ok(())
+}
+
+/// What a repair managed to finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repair {
+    pub recovery: Recovery,
+    pub identity: IdentityRepair,
+}
+
+/// How far the identity half of a repair got.
+///
+/// Separate from `Recovery` because the two halves fail independently: the
+/// renames need nothing but byte's own store and the app's directory, while
+/// the patch needs to find, read and rewrite `config.json`. A caller has to
+/// be able to tell the user which of the two is still outstanding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityRepair {
+    /// `config.json` now describes the session that is in place.
+    Restored,
+    /// There was nothing recorded to restore, and `config.json` already
+    /// describes the session that is in place.
+    NotNeeded,
+    /// The account's stored `oauth.json` is there and could not be read. On
+    /// a roll-forward the app was left signed out rather than
+    /// authenticating as the account whose session just moved away; on a
+    /// reversal `config.json` was left exactly as it was, since it still
+    /// describes the session being restored.
+    Unreadable(PathBuf),
+    /// No desktop paths were available, so `config.json` was never reached.
+    /// The journal is deliberately left on disk: only a later command, one
+    /// that can locate the app, is able to finish this.
+    Deferred,
+}
+
+/// Finish the identity half of a repair: make `config.json` describe
+/// whichever session the directory half just put in place.
+///
+/// `journal.outgoing` and `journal.incoming` are what name it. Roll-forward
+/// ends with the incoming account's profile live, so the incoming account's
+/// parked `oauth.json` is what belongs in `config.json` -- or nothing at
+/// all, when the swap was installing nothing and the app must end up signed
+/// out. Reversal ends with the outgoing account's profile back in place, so
+/// its parked keys are what belong there.
+///
+/// Reversal never CLEARS, only restores: `config.json` on that path is
+/// either untouched (still the outgoing account's, since the patch runs
+/// after every rename) or already cleared by a patch that did run. It can
+/// never hold the incoming account's keys, so there is no blend to break up
+/// -- and clearing a file that legitimately describes the session being
+/// restored would sign the user out for no reason.
+fn restore_identity<P: HostPaths, D: DesktopPaths>(
+    paths: &P,
+    desktop: Option<&D>,
+    journal: &Journal,
+    recovery: Recovery,
+) -> Result<IdentityRepair> {
+    let Some(desktop) = desktop else {
+        return Ok(IdentityRepair::Deferred);
+    };
+    let config_file = desktop.config_file();
+    let backups = paths.backup_dir();
+
+    let account = match recovery {
+        Recovery::RollForward => journal.incoming.as_deref(),
+        Recovery::Reverse => journal.outgoing.as_deref(),
+    };
+
+    let signed_out = config::DesktopOauth::default();
+
+    let Some(account) = account else {
+        if recovery == Recovery::Reverse {
+            return Ok(IdentityRepair::NotNeeded);
+        }
+        // Nothing was being installed, so the swap's own ending is a
+        // signed-out app waiting for a login to capture.
+        config::apply_if_changed(&config_file, &signed_out, &backups)?;
+        return Ok(IdentityRepair::Restored);
+    };
+
+    let stored = paths.desktop_profile_dir(account).join("oauth.json");
+    match config::read_stored(&stored) {
+        config::StoredOauth::Loaded(oauth) => {
+            config::apply_if_changed(&config_file, &oauth, &backups)?;
+            Ok(IdentityRepair::Restored)
+        }
+        config::StoredOauth::Absent if recovery == Recovery::RollForward => {
+            config::apply_if_changed(&config_file, &signed_out, &backups)?;
+            Ok(IdentityRepair::Restored)
+        }
+        config::StoredOauth::Absent => Ok(IdentityRepair::NotNeeded),
+        config::StoredOauth::Unreadable(_) if recovery == Recovery::RollForward => {
+            config::apply_if_changed(&config_file, &signed_out, &backups)?;
+            Ok(IdentityRepair::Unreadable(stored))
+        }
+        config::StoredOauth::Unreadable(_) => Ok(IdentityRepair::Unreadable(stored)),
+    }
 }
 
 /// Repair a swap left behind by a crash, kill, or power loss.
@@ -269,7 +401,17 @@ pub fn execute(paths: &impl HostPaths, mut journal: Journal) -> Result<()> {
 /// Called at the start of EVERY byte command, not just `switch`: a half-swap
 /// has to be repaired by whatever runs next, not only by a retry of the
 /// command that failed.
-pub fn recover_if_interrupted(paths: &impl HostPaths) -> Result<Option<Recovery>> {
+///
+/// `desktop` is `None` when no `DesktopPaths` could be discovered for this
+/// platform or environment. The directory half is repaired anyway -- it
+/// needs only the paths recorded in the journal -- and the journal is then
+/// left in place, because the identity half is still outstanding and this
+/// process cannot finish it. Skipping the repair entirely would strand the
+/// directories as well as the identity.
+pub fn recover_if_interrupted<P: HostPaths, D: DesktopPaths>(
+    paths: &P,
+    desktop: Option<&D>,
+) -> Result<Option<Repair>> {
     let file = paths.desktop_journal_file();
     let bytes = match std::fs::read(&file) {
         Ok(b) => b,
@@ -328,6 +470,14 @@ pub fn recover_if_interrupted(paths: &impl HostPaths) -> Result<Option<Recovery>
         }
     }
 
-    clear_journal(paths)?;
-    Ok(Some(recovery))
+    let identity = restore_identity(paths, desktop, &journal, recovery)?;
+
+    // The journal is the record of BOTH halves, so it is cleared only when
+    // both are as finished as they are going to get. `Deferred` is the one
+    // answer that is not finished: this process could not locate the app, so
+    // the record has to survive for one that can.
+    if identity != IdentityRepair::Deferred {
+        clear_journal(paths)?;
+    }
+    Ok(Some(Repair { recovery, identity }))
 }

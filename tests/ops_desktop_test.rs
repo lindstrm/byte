@@ -370,6 +370,23 @@ fn an_absent_account_uuid_is_not_a_mismatch_and_still_parks() {
         "signed-out",
         "an unidentified live profile is still parked, not stranded in the live directory"
     );
+
+    // This is the ONE fixture where the outgoing account's name and the live
+    // `lastKnownAccountUuid` differ, so it is the only place that can tell a
+    // parked identity READ from `config.json` apart from one synthesised
+    // from the `outgoing` parameter. There was no session, so byte must
+    // record that there was none -- inventing `"a"` here would make a later
+    // switch back into "a" stamp an identity the app never had over a
+    // profile that holds no token to match it.
+    let parked: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tp.desktop_profile_dir("a").join("oauth.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        parked["account_uuid"],
+        serde_json::Value::Null,
+        "the parked identity must be what config.json said, not the outgoing account's name"
+    );
 }
 
 /// A realistic unrepaired journal: one park that already completed, with the
@@ -597,4 +614,343 @@ fn switching_into_an_account_whose_park_stored_nothing_reports_no_stored_profile
         DesktopOutcome::NoProfileForIncoming,
         "an empty park stores no session, so switching back into it restores nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review findings on the journal's boundary. The tests below pin the seam
+// between the journalled directory renames and the `config.json` patch that
+// used to sit outside them, and the two ways byte could destroy a stored
+// credential while reporting success.
+// ---------------------------------------------------------------------------
+
+/// A live desktop session signed in as `uuid`, carrying a real token cache as
+/// well as an identity -- the shape `seed_live` deliberately lacks, so a test
+/// can tell a genuine capture from an all-`None` one.
+fn seed_live_signed_in(d: &TestDesktopPaths, uuid: &str) {
+    let dir = d.desktop_dir().join("Network");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker.txt"), format!("account-{uuid}")).unwrap();
+    std::fs::write(
+        d.config_file(),
+        serde_json::json!({
+            "lastKnownAccountUuid": uuid,
+            "oauth:tokenCacheV2": {"accessToken": format!("{uuid}-token")},
+            "locale": "en-GB"
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_all_none_capture_never_overwrites_a_parked_oauth_over_a_real_profile() {
+    // The drift this reproduces is ordinary, not exotic:
+    //
+    // 1. Desktop and Code are both on "a". `byte switch b` (b unstored) parks
+    //    a's directories into `<store>/a`, writes a's real keys to
+    //    `<store>/a/oauth.json`, and `config::clear`s the live config --
+    //    which REMOVES `lastKnownAccountUuid`. byte manufactures the exact
+    //    state its own absent-uuid carve-out treats as harmless.
+    // 2. A tray click switches Claude CODE back to "a". The tray never
+    //    touches the desktop app, so it stays signed out and `<store>/a`
+    //    stays full.
+    // 3. `byte switch c` names "a" as outgoing. The capture reads all-`None`
+    //    out of the cleared config; the identity guard sees no uuid and waves
+    //    it through; the park overwrites `<store>/a/oauth.json` with
+    //    `{null,null,null}` and a's real desktop token is gone for good.
+    //
+    // An EMPTY `<store>/a` is what makes an absent uuid mean "no session to
+    // misfile". A full one makes it mean "the live directory is not the
+    // session byte thinks it is".
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let probe = FakeProbe::with_desktop(0, false);
+    seed_live_signed_in(&dp, "a");
+
+    // Step 1.
+    switch_desktop(&tp, &dp, &probe, Some("a"), "b").unwrap();
+    let parked = tp.desktop_profile_dir("a").join("oauth.json");
+    let genuine = std::fs::read_to_string(&parked).unwrap();
+    assert!(
+        genuine.contains("a-token"),
+        "the park must have stored a's real token to begin with, got: {genuine}"
+    );
+    // Step 2 needs no byte call at all -- that is the whole point.
+
+    // Step 3.
+    let out = switch_desktop(&tp, &dp, &probe, Some("a"), "c").unwrap();
+
+    assert_eq!(
+        out,
+        DesktopOutcome::IdentityMismatch,
+        "an unidentified live session over a full store is drift, not a green light"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&parked).unwrap(),
+        genuine,
+        "a's real desktop token must survive byte-for-byte, not be replaced by nulls"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tp.desktop_profile_dir("a").join("Network/marker.txt")).unwrap(),
+        "account-a",
+        "the refusal must touch nothing at all"
+    );
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "no swap may have been planned, let alone started"
+    );
+}
+
+#[test]
+fn an_all_none_capture_never_overwrites_parked_keys_that_have_no_directories() {
+    // The other half of the same protection, and the reason it lives at the
+    // write rather than only in the park-target decision. A park files two
+    // things side by side, and can legitimately produce keys with no
+    // directories: a live profile whose every entry is denylisted stores a
+    // real `oauth.json` and moves nothing. The parked-directory check waves
+    // that store through as "empty", so only a check on the keys themselves
+    // stops an empty capture replacing them with `{null,null,null}` -- and
+    // `oauth.json` is in no journal, so nothing would ever repair it.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let store_a = tp.desktop_profile_dir("a");
+    std::fs::create_dir_all(&store_a).unwrap();
+    let genuine = serde_json::json!({
+        "oauth": {"oauth:tokenCacheV2": {"accessToken": "a-token"}},
+        "account_uuid": "a"
+    })
+    .to_string();
+    std::fs::write(store_a.join("oauth.json"), &genuine).unwrap();
+    assert!(
+        !store_a.join("Network").exists(),
+        "the store under test holds keys and no directories"
+    );
+
+    // A signed-out live app: nothing to capture.
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({"locale": "en-GB"}).to_string(),
+    )
+    .unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b").unwrap();
+
+    assert_eq!(out, DesktopOutcome::IdentityMismatch);
+    assert_eq!(
+        std::fs::read_to_string(store_a.join("oauth.json")).unwrap(),
+        genuine,
+        "a's parked keys must survive byte-for-byte"
+    );
+}
+
+#[test]
+fn a_logged_out_claude_code_does_not_blend_the_live_desktop_session_into_the_incoming_one() {
+    // `desktop_half` maps `SyncOutcome::LoggedOut` to `outgoing: None`, so
+    // the identity guard -- which only evaluates when BOTH an outgoing uuid
+    // and a capture are present -- never runs, and no park is planned. The
+    // live directory's contents stay in place while the incoming profile's
+    // install moves land beside them.
+    //
+    // The entry sets here are deliberately DISJOINT (live holds "Network",
+    // the stored profile holds "IndexedDB"), because that is the silent
+    // version: overlapping names collide and at least produce an error.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live_signed_in(&dp, "a");
+    let stored = tp.desktop_profile_dir("b").join("IndexedDB");
+    std::fs::create_dir_all(&stored).unwrap();
+    std::fs::write(stored.join("marker.txt"), "account-b").unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), None, "b").unwrap();
+
+    assert_eq!(out, DesktopOutcome::Switched);
+    assert!(
+        !dp.desktop_dir().join("Network").exists(),
+        "a's cookies must not be left underneath b's freshly stamped identity"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tp.desktop_profile_dir("a").join("Network/marker.txt")).unwrap(),
+        "account-a",
+        "byte knows whose session this is from config.json; it must park it under that uuid"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("IndexedDB/marker.txt")).unwrap(),
+        "account-b"
+    );
+    let parked: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tp.desktop_profile_dir("a").join("oauth.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        parked["account_uuid"],
+        serde_json::json!("a"),
+        "a's OAuth keys must be parked with a's profile, not discarded"
+    );
+}
+
+#[test]
+fn a_corrupt_stored_oauth_does_not_report_a_plain_switch() {
+    // `serde_json::from_slice(..).unwrap_or_default()` turns an unreadable
+    // stored capture into `DesktopOauth::default()`, which `config::apply`
+    // treats as removal -- so byte installs the account's cookies and then
+    // signs the app out, while telling the user "Claude desktop app switched
+    // too."
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live_signed_in(&dp, "a");
+    let store_b = tp.desktop_profile_dir("b");
+    std::fs::create_dir_all(store_b.join("Network")).unwrap();
+    std::fs::write(store_b.join("Network/marker.txt"), "account-b").unwrap();
+    std::fs::write(store_b.join("oauth.json"), b"{ truncated mid-writ").unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b").unwrap();
+
+    assert_eq!(
+        out,
+        DesktopOutcome::SwitchedWithoutIdentity,
+        "the swap committed but the app is signed out; reporting a plain switch is a lie"
+    );
+    // The directories still moved -- a reporting detail must never undo a
+    // committed swap.
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-b"
+    );
+    // ...and the outgoing account's keys are gone rather than left behind
+    // for b's cookies to authenticate with.
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert!(cfg.get("lastKnownAccountUuid").is_none());
+    assert!(cfg.get("oauth:tokenCacheV2").is_none());
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "the swap is as finished as it can be; rereading the same corrupt file will not help"
+    );
+}
+
+#[test]
+fn a_config_patch_that_fails_leaves_the_journal_for_the_next_command() {
+    // `config::apply` fails on entirely ordinary conditions --
+    // `JsonDocument::save` backs the file up first, which is where this
+    // codebase already meets "Access is denied (os error 5)". With the patch
+    // outside the journal's commit boundary the journal is cleared BEFORE it
+    // runs, so the error propagates over roughly sixteen already-moved
+    // directories with no record left of them: the app authenticates from the
+    // outgoing account's token cache over the incoming account's cookie jar,
+    // and nothing repairs it.
+    //
+    // The failure is injected portably by replacing the backup DIRECTORY with
+    // a file, which is what `atomic::backup`'s `create_dir_all` trips over --
+    // and nothing before the patch writes through it.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live_signed_in(&dp, "a");
+    let stored = tp.desktop_profile_dir("b").join("Network");
+    std::fs::create_dir_all(&stored).unwrap();
+    std::fs::write(stored.join("marker.txt"), "account-b").unwrap();
+
+    std::fs::remove_dir(tp.backup_dir()).unwrap();
+    std::fs::write(tp.backup_dir(), b"not a directory").unwrap();
+
+    let err = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b")
+        .expect_err("an unwritable backup directory must fail the config patch");
+    assert!(
+        matches!(err, byte::Error::Io { .. }),
+        "expected the backup directory's io error, got: {err}"
+    );
+
+    let journal = Journal::from_bytes(
+        &std::fs::read(tp.desktop_journal_file())
+            .expect("the journal must survive an unfinished patch so the next command retries it"),
+    )
+    .unwrap();
+    assert!(
+        journal.is_complete(),
+        "every rename landed; what is outstanding is the identity patch"
+    );
+    assert_eq!(journal.incoming.as_deref(), Some("b"));
+}
+
+#[test]
+fn a_completed_switch_clears_the_journal_only_after_the_identity_lands() {
+    // The commit boundary, stated from the outside: when `switch_desktop`
+    // returns `Switched`, both halves are done and no journal is left for the
+    // next command to "repair" a finished swap with.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live_signed_in(&dp, "a");
+    let stored = tp.desktop_profile_dir("b").join("Network");
+    std::fs::create_dir_all(&stored).unwrap();
+    std::fs::write(stored.join("marker.txt"), "account-b").unwrap();
+    // b's stored identity, in the legacy on-disk shape an existing install
+    // would already have on disk.
+    std::fs::write(
+        tp.desktop_profile_dir("b").join("oauth.json"),
+        serde_json::json!({
+            "token_cache": null,
+            "token_cache_v2": {"accessToken": "b-token"},
+            "account_uuid": "b"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b").unwrap();
+
+    assert_eq!(out, DesktopOutcome::Switched);
+    assert!(!tp.desktop_journal_file().exists());
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert_eq!(cfg["lastKnownAccountUuid"], serde_json::json!("b"));
+    assert_eq!(
+        cfg["oauth:tokenCacheV2"],
+        serde_json::json!({"accessToken": "b-token"}),
+        "an oauth.json written by the previous format must still load"
+    );
+}
+
+#[test]
+fn an_unrecognised_oauth_key_travels_with_the_account_through_a_real_switch() {
+    // `oauth:tokenCache` -> `oauth:tokenCacheV2` already happened once; the
+    // next rename is not byte's to predict. A hardcoded allowlist leaves the
+    // OUTGOING account's newer cache sitting in `config.json` underneath the
+    // incoming account's identity -- nothing strands, it leaks.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let probe = FakeProbe::with_desktop(0, false);
+    std::fs::create_dir_all(dp.desktop_dir().join("Network")).unwrap();
+    std::fs::write(dp.desktop_dir().join("Network/marker.txt"), "account-a").unwrap();
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({
+            "lastKnownAccountUuid": "a",
+            "oauth:tokenCacheV3": {"accessToken": "a-v3"},
+            "locale": "en-GB"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Park a, leaving the app signed out for b.
+    switch_desktop(&tp, &dp, &probe, Some("a"), "b").unwrap();
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert!(
+        cfg.get("oauth:tokenCacheV3").is_none(),
+        "a's unrecognised cache must not be left behind for b to authenticate from"
+    );
+
+    // Sign in as b, then switch back to a.
+    std::fs::create_dir_all(dp.desktop_dir().join("Network")).unwrap();
+    std::fs::write(dp.desktop_dir().join("Network/marker.txt"), "account-b").unwrap();
+    switch_desktop(&tp, &dp, &probe, Some("b"), "a").unwrap();
+
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert_eq!(
+        cfg["oauth:tokenCacheV3"],
+        serde_json::json!({"accessToken": "a-v3"}),
+        "a's unrecognised cache must come back with a's profile"
+    );
+    assert_eq!(cfg["locale"], serde_json::json!("en-GB"));
 }

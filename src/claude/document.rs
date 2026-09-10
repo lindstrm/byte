@@ -1,7 +1,7 @@
 //! A JSON document that can be patched without disturbing anything else.
 //!
-//! byte owns at most three keys across two files that contain, between them,
-//! a great deal of unrelated user state. Every read parses into
+//! byte owns a handful of keys across three files that contain, between
+//! them, a great deal of unrelated user state. Every read parses into
 //! `serde_json::Value` (order-preserving, see the crate's `preserve_order`
 //! feature) and every write re-serialises that same value with only the
 //! targeted keys replaced. The document is never deserialised into a typed
@@ -88,6 +88,21 @@ impl JsonDocument {
 
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.value.get(key)
+    }
+
+    /// Every top-level key, in document order.
+    ///
+    /// Owned rather than borrowed so a caller can iterate the names while
+    /// mutating the document -- `desktop::config::apply` removes the
+    /// `oauth:`-prefixed keys the incoming account does not carry, which
+    /// borrowing the map would forbid. A document whose root is not an
+    /// object has no top-level keys, matching `get`/`set`/`remove`, all of
+    /// which are no-ops there.
+    pub fn top_level_keys(&self) -> Vec<String> {
+        match &self.value {
+            Value::Object(map) => map.keys().cloned().collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// Replace (or insert) a top-level key. An existing key keeps its position

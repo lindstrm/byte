@@ -17,10 +17,11 @@ use byte::claude::detect::FakeProbe;
 use byte::claude::files::ClaudeFiles;
 use byte::claude::snapshot::SCHEMA_VERSION;
 use byte::cli::run::{
-    cmd_add, cmd_switch, format_size, recover_under_lock, resolve_add_failure,
+    cmd_add, cmd_switch, format_size, recover_under_lock, repair_message, resolve_add_failure,
     running_sessions_warning, switch_json,
 };
 use byte::desktop::paths::{DesktopPaths, TestDesktopPaths};
+use byte::desktop::swap::{IdentityRepair, Recovery, Repair};
 use byte::lock::MutationGuard;
 use byte::ops::desktop::DesktopOutcome;
 use byte::ops::switch::{SwitchOutcome, Switcher, SyncOutcome};
@@ -585,7 +586,74 @@ fn switch_json_names_every_desktop_outcome_in_lower_snake_case() {
         field(DesktopOutcome::IdentityMismatch),
         json!("identity_mismatch")
     );
+    // Distinct from `switched`, and deliberately so: the profile moved but
+    // the app will open signed out, and a script driving `--json` has to be
+    // able to tell those apart.
+    assert_eq!(
+        field(DesktopOutcome::SwitchedWithoutIdentity),
+        json!("switched_without_identity")
+    );
     assert_eq!(field(DesktopOutcome::NothingToDo), json!("nothing_to_do"));
+}
+
+// A repair now has two halves -- the renames and the patch of the desktop
+// app's own `config.json` -- which can finish independently. The message has
+// to say which, because `docs/troubleshooting.md` reads the plain wording as
+// "nothing further is needed".
+
+#[test]
+fn a_fully_repaired_swap_is_reported_plainly() {
+    let msg = repair_message(&Repair {
+        recovery: Recovery::RollForward,
+        identity: IdentityRepair::Restored,
+    });
+
+    assert_eq!(
+        msg,
+        "repaired an interrupted desktop profile swap (RollForward)."
+    );
+    assert_eq!(
+        repair_message(&Repair {
+            recovery: Recovery::Reverse,
+            identity: IdentityRepair::NotNeeded,
+        }),
+        "repaired an interrupted desktop profile swap (Reverse).",
+        "nothing to restore is still a finished repair"
+    );
+}
+
+#[test]
+fn a_repair_that_could_not_reach_the_config_says_what_is_outstanding() {
+    let msg = repair_message(&Repair {
+        recovery: Recovery::Reverse,
+        identity: IdentityRepair::Deferred,
+    });
+
+    assert!(
+        msg.contains("directory half"),
+        "the user must not be told the whole swap was repaired: {msg}"
+    );
+    assert!(
+        msg.contains("journal has been kept"),
+        "and must be told why a journal is still on disk: {msg}"
+    );
+}
+
+#[test]
+fn a_repair_with_an_unreadable_saved_sign_in_names_the_file() {
+    let msg = repair_message(&Repair {
+        recovery: Recovery::RollForward,
+        identity: IdentityRepair::Unreadable(PathBuf::from("/store/u1/oauth.json")),
+    });
+
+    assert!(
+        msg.contains("oauth.json"),
+        "the file the user has to look at must be in the message: {msg}"
+    );
+    assert!(
+        msg.contains("signed out"),
+        "and what they will actually see when they open the app: {msg}"
+    );
 }
 
 #[test]
@@ -662,7 +730,7 @@ fn recovery_is_skipped_while_another_process_holds_the_mutation_lock() {
     // even from the same process (see tests/lock_test.rs).
     let _held = MutationGuard::acquire(&tp).expect("the lock must start free");
 
-    recover_under_lock(&tp);
+    recover_under_lock(&tp, Some(&dp));
 
     assert_eq!(
         std::fs::read_to_string(tp.desktop_journal_file()).unwrap_or_default(),
@@ -691,29 +759,51 @@ fn recovery_still_runs_when_the_lock_is_free() {
     let parked = tp.desktop_profile_dir("u1").join("Network");
     std::fs::create_dir_all(&parked).unwrap();
     std::fs::write(parked.join("marker.txt"), "account-1").unwrap();
+    // A second entry still sitting in the live directory: the park is
+    // genuinely half-done, which is what makes this an interrupted swap
+    // rather than a finished one whose journal outlived it. A journal with
+    // nothing outstanding rolls forward instead -- see
+    // `swap::recovery_for`.
+    let still_live = dp.desktop_dir().join("IndexedDB");
+    std::fs::create_dir_all(&still_live).unwrap();
+    std::fs::write(still_live.join("marker.txt"), "account-1").unwrap();
     std::fs::write(
         tp.desktop_journal_file(),
         json!({
             "version": 1,
             "outgoing": "u1",
             "incoming": null,
-            "moves": [{
-                "stage": "Park",
-                "from": dp.desktop_dir().join("Network"),
-                "to": parked,
-                "done": true
-            }]
+            "moves": [
+                {
+                    "stage": "Park",
+                    "from": dp.desktop_dir().join("Network"),
+                    "to": parked,
+                    "done": true
+                },
+                {
+                    "stage": "Park",
+                    "from": still_live,
+                    "to": tp.desktop_profile_dir("u1").join("IndexedDB"),
+                    "done": false
+                }
+            ]
         })
         .to_string(),
     )
     .unwrap();
 
-    recover_under_lock(&tp);
+    recover_under_lock(&tp, Some(&dp));
 
     assert_eq!(
         std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
         "account-1",
-        "no install completed, so the park must be reversed and the session restored"
+        "no install completed and the park is unfinished, so it must be reversed \
+         and the session restored"
+    );
+    assert_eq!(
+        std::fs::read_to_string(still_live.join("marker.txt")).unwrap(),
+        "account-1",
+        "the entry that was never parked must still be live"
     );
     assert!(
         !tp.desktop_journal_file().exists(),

@@ -450,11 +450,18 @@ fn any_command_repairs_an_interrupted_desktop_swap() {
     let live = tp.root().join("desktop");
     std::fs::create_dir_all(&live).unwrap();
 
-    // A half-completed park: the directory is already in the store, and the
-    // journal records that one move as done.
+    // A half-completed park: one directory is already in the store and the
+    // journal records that move as done, while a second is still sitting in
+    // the live directory with its move outstanding. Both halves matter -- a
+    // journal with NOTHING outstanding describes a swap whose renames all
+    // finished, and is rolled forward rather than undone (see
+    // `desktop::swap::recovery_for`).
     let parked = tp.desktop_profile_dir("u1").join("Network");
     std::fs::create_dir_all(&parked).unwrap();
     std::fs::write(parked.join("marker.txt"), "account-1").unwrap();
+    let still_live = live.join("IndexedDB");
+    std::fs::create_dir_all(&still_live).unwrap();
+    std::fs::write(still_live.join("marker.txt"), "account-1").unwrap();
     std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
     std::fs::write(
         tp.desktop_journal_file(),
@@ -462,12 +469,20 @@ fn any_command_repairs_an_interrupted_desktop_swap() {
             "version": 1,
             "outgoing": "u1",
             "incoming": null,
-            "moves": [{
-                "stage": "Park",
-                "from": live.join("Network"),
-                "to": parked,
-                "done": true
-            }]
+            "moves": [
+                {
+                    "stage": "Park",
+                    "from": live.join("Network"),
+                    "to": parked,
+                    "done": true
+                },
+                {
+                    "stage": "Park",
+                    "from": still_live,
+                    "to": tp.desktop_profile_dir("u1").join("IndexedDB"),
+                    "done": false
+                }
+            ]
         })
         .to_string(),
     )

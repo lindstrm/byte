@@ -157,6 +157,16 @@ attempted, since moving its files out from underneath a running process
 risks corrupting the session. Quit Claude and run the same switch again to
 move it.
 
+**Whose session is it?** byte files the live desktop session under the
+account the app itself says it is signed in as (`config.json`'s
+`lastKnownAccountUuid`), not under whichever account Claude Code happened to
+be on — the two drift apart the moment you use the tray, or sign into Claude
+Desktop by hand. Where it cannot tell (the app reports a different account,
+or reports none while byte already has a session stored for that account),
+it changes nothing and says so rather than filing one account's cookies
+under another's name. Fix that by signing in to Claude Desktop as the
+account you want; byte captures it on the next switch away.
+
 **Credentials on disk.** A desktop session's cookies don't fit in the OS
 credential store, so each account's parked session is stored as ordinary
 files under `<byte config dir>/desktop/` instead — the one place byte keeps

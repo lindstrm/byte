@@ -6,6 +6,7 @@ use crate::autostart;
 use crate::claude::detect::{ProcessProbe, SysinfoProbe};
 use crate::cli::{AutostartAction, Cli, Command};
 use crate::desktop::paths::{DesktopPaths, RealDesktopPaths};
+use crate::desktop::swap::{IdentityRepair, Repair};
 use crate::error::{Error, Result};
 use crate::lock::MutationGuard;
 use crate::ops::add::AddSession;
@@ -23,12 +24,30 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500)
 pub fn run(cli: Cli) -> Result<()> {
     let paths = RealPaths::discover()?;
 
+    // Resolved BEFORE recovery, not just before the switch: a half-finished
+    // swap includes a half-finished patch of the app's own `config.json`,
+    // and recovery cannot finish that without knowing where the app lives.
+    //
+    // `RealDesktopPaths::discover` fails when neither `CLAUDE_DESKTOP_DIR`
+    // nor `%APPDATA%` is set, which is the ordinary state of every
+    // non-Windows machine -- this feature only understands the Windows
+    // desktop app's layout (see `src/desktop/paths.rs`). `.ok()` degrades
+    // that to "the desktop half is not attempted" rather than failing every
+    // `byte` invocation outright: the desktop switch is an addition to the
+    // Claude Code switch, never a precondition for it, and warning about a
+    // directory that will never exist on those platforms on every single
+    // invocation would be permanent noise, not a fixable problem. A genuine
+    // failure to switch the desktop half once paths ARE available is a
+    // different matter, and is reported -- see `cmd_switch`'s own handling,
+    // and `recover_under_lock`'s `Deferred` case.
+    let desktop = RealDesktopPaths::discover().ok();
+
     // Every command begins by repairing a desktop swap that an earlier run
     // left half-finished -- but only while it can take the mutation lock,
     // since an ungated repair would rename directories backwards underneath
     // a swap another byte process is running right now. See
     // `recover_under_lock`, which owns the whole rationale.
-    recover_under_lock(&paths);
+    recover_under_lock(&paths, desktop.as_ref());
 
     // No arguments starts the tray rather than listing accounts (see
     // `Cli::long_about`). Handled before `Switcher` even exists: `tray::run`
@@ -59,21 +78,6 @@ pub fn run(cli: Cli) -> Result<()> {
             // alive until this arm's block ends, which is after the command
             // completes.
             let _guard = MutationGuard::acquire(&paths)?;
-
-            // `RealDesktopPaths::discover` fails when neither
-            // `CLAUDE_DESKTOP_DIR` nor `%APPDATA%` is set, which is the
-            // ordinary state of every non-Windows machine -- this feature
-            // only understands the Windows desktop app's layout (see
-            // `src/desktop/paths.rs`). `.ok()` degrades that to "the
-            // desktop half is not attempted" rather than failing `byte
-            // switch` outright: the desktop switch is an addition to the
-            // Claude Code switch, never a precondition for it, and warning
-            // about a directory that will never exist on those platforms
-            // on every single invocation would be permanent noise, not a
-            // fixable problem. A genuine failure to switch the desktop
-            // half once paths ARE available is a different matter, and is
-            // reported -- see `cmd_switch`'s own handling.
-            let desktop = RealDesktopPaths::discover().ok();
             cmd_switch(&switcher, &name, cli.json, &probe, desktop.as_ref())
         }
         Command::Capture => {
@@ -150,12 +154,10 @@ pub fn run(cli: Cli) -> Result<()> {
 /// `pub` (like `switch_json` and `resolve_add_failure`) specifically so the
 /// lock gate is directly testable against a `TestPaths` -- `run` itself
 /// resolves `RealPaths`, i.e. the developer's real config directory.
-pub fn recover_under_lock(paths: &impl HostPaths) {
+pub fn recover_under_lock<P: HostPaths, D: DesktopPaths>(paths: &P, desktop: Option<&D>) {
     match MutationGuard::try_acquire(paths) {
-        Ok(Some(_guard)) => match crate::desktop::swap::recover_if_interrupted(paths) {
-            Ok(Some(recovery)) => output::warn(&format!(
-                "repaired an interrupted desktop profile swap ({recovery:?})."
-            )),
+        Ok(Some(_guard)) => match crate::desktop::swap::recover_if_interrupted(paths, desktop) {
+            Ok(Some(repair)) => output::warn(&repair_message(&repair)),
             Ok(None) => {}
             Err(e) => output::warn(&format!(
                 "an earlier desktop profile swap could not be repaired automatically, so this \
@@ -167,6 +169,37 @@ pub fn recover_under_lock(paths: &impl HostPaths) {
             "byte could not take its mutation lock to check for an interrupted desktop profile \
              swap, so this command is continuing without checking: {e}"
         )),
+    }
+}
+
+/// What the user is told after an interrupted swap was repaired.
+///
+/// A swap is roughly sixteen directory renames AND a patch of the desktop
+/// app's own `config.json`, and the two halves can finish independently, so
+/// this must not promise more than actually happened -- "nothing further is
+/// needed" is true only when both landed.
+///
+/// `pub` (like `running_sessions_warning` and `format_size`) specifically so
+/// each wording is directly testable without a keychain, a real
+/// `%APPDATA%\Claude`, or an interrupted swap to reproduce.
+pub fn repair_message(repair: &Repair) -> String {
+    let recovery = repair.recovery;
+    match &repair.identity {
+        IdentityRepair::Restored | IdentityRepair::NotNeeded => {
+            format!("repaired an interrupted desktop profile swap ({recovery:?}).")
+        }
+        IdentityRepair::Unreadable(path) => format!(
+            "repaired an interrupted desktop profile swap ({recovery:?}), but the saved \
+             sign-in at {} could not be read, so Claude Desktop may open signed out. Sign in \
+             there once and byte will capture it again.",
+            path.display()
+        ),
+        IdentityRepair::Deferred => format!(
+            "repaired the directory half of an interrupted desktop profile swap \
+             ({recovery:?}), but Claude Desktop's own data directory could not be located, so \
+             which account it is signed in as was left alone. The swap's journal has been kept \
+             so a later byte command can finish it."
+        ),
     }
 }
 
@@ -336,6 +369,7 @@ fn desktop_json(outcome: Option<&Result<DesktopOutcome>>) -> serde_json::Value {
         Some(Ok(DesktopOutcome::AppRunning)) => "app_running",
         Some(Ok(DesktopOutcome::NoProfileForIncoming)) => "no_profile_for_incoming",
         Some(Ok(DesktopOutcome::IdentityMismatch)) => "identity_mismatch",
+        Some(Ok(DesktopOutcome::SwitchedWithoutIdentity)) => "switched_without_identity",
         Some(Ok(DesktopOutcome::NothingToDo)) => "nothing_to_do",
         Some(Err(_)) => "failed",
     };
@@ -520,6 +554,15 @@ fn report_desktop_outcome(outcome: &Result<DesktopOutcome>) {
              there is nothing more to do. Otherwise, sign out of Claude Desktop and sign in \
              again there as the account you want; byte will capture that session the next \
              time you switch away from it.",
+        ),
+        // The profile moved, but the account's saved sign-in could not be
+        // read, so the app will open signed out. `switch_desktop` has
+        // already warned, naming the file and the parse failure -- facts
+        // only it holds. This adds what to do about it, and deliberately
+        // does not repeat them.
+        Ok(DesktopOutcome::SwitchedWithoutIdentity) => output::warn(
+            "Claude's desktop app has this account's session back, but will open signed out. \
+             Sign in there once and byte will remember it again.",
         ),
         Ok(DesktopOutcome::NothingToDo) => {}
         Err(e) => output::warn(&desktop_failure_message(e)),

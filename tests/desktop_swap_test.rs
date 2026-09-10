@@ -1,10 +1,31 @@
 use std::path::Path;
 
 use byte::desktop::journal::{Journal, Move, Stage};
+use byte::desktop::paths::{DesktopPaths, TestDesktopPaths};
 use byte::desktop::swap::{
-    Recovery, create_store_dir, execute, recover_if_interrupted, recovery_for,
+    IdentityRepair, Recovery, Repair, clear_journal, create_store_dir, execute,
+    recover_if_interrupted, recovery_for,
 };
 use byte::paths::{HostPaths, TestPaths};
+
+/// Repair with a throwaway desktop directory attached.
+///
+/// A swap is not only its renames: the desktop app decides which account it
+/// is signed in as from keys in its own `config.json`, and recovery finishes
+/// that half too. So even a test that asserts nothing about `config.json`
+/// has to give the repair somewhere to put the identity -- without it the
+/// repair reports `Deferred` and deliberately KEEPS the journal, because
+/// only a later command could finish it. Tests that do care about
+/// `config.json`'s contents pass their own paths instead.
+fn try_recover(tp: &TestPaths) -> byte::Result<Option<Repair>> {
+    let dp = TestDesktopPaths::new().unwrap();
+    recover_if_interrupted(tp, Some(&dp))
+}
+
+/// [`try_recover`], reporting only which way the repair went.
+fn recovered(tp: &TestPaths) -> Option<Recovery> {
+    try_recover(tp).unwrap().map(|r| r.recovery)
+}
 
 fn seed(dir: &Path, names: &[(&str, &str)]) {
     std::fs::create_dir_all(dir).unwrap();
@@ -88,7 +109,15 @@ fn a_completed_swap_moves_the_live_session_out_and_the_stored_one_in() {
 }
 
 #[test]
-fn a_successful_swap_leaves_no_journal_behind() {
+fn execute_leaves_the_journal_for_the_caller_that_finishes_the_swap() {
+    // The commit boundary. `execute` runs the renames; the desktop app's own
+    // `config.json` still names the outgoing account at this point, and
+    // patching it is the rest of the same swap. Clearing here would put that
+    // patch outside the record, so a crash -- or an ordinary `Err` from the
+    // backup copy `JsonDocument::save` makes first -- would leave one
+    // account's identity over another's cookie jar with nothing on disk
+    // saying so. `ops::desktop::switch_desktop` clears it once both halves
+    // have landed.
     let tp = TestPaths::new().unwrap();
     let live = tp.root().join("Claude");
     seed(&live, &[("Network", "a")]);
@@ -96,10 +125,36 @@ fn a_successful_swap_leaves_no_journal_behind() {
 
     execute(&tp, j).unwrap();
 
+    let left = Journal::from_bytes(&std::fs::read(tp.desktop_journal_file()).unwrap()).unwrap();
+    assert!(
+        left.is_complete(),
+        "every rename landed; the journal survives for the identity half alone"
+    );
+
+    clear_journal(&tp).unwrap();
     assert!(
         !tp.desktop_journal_file().exists(),
         "a stale journal would make the next byte command 'repair' a finished swap"
     );
+    // Idempotent: `switch_desktop` calls this on paths that may have had no
+    // journal written at all, and a repeat must not fail.
+    clear_journal(&tp).unwrap();
+}
+
+#[test]
+fn a_plan_with_no_moves_still_records_the_swap() {
+    // "No directory moves" does not mean "no work": a park that finds
+    // nothing movable still has to clear the app's account keys, and that
+    // patch needs a record for the same reason every other one does.
+    let tp = TestPaths::new().unwrap();
+    let live = tp.root().join("Claude");
+    std::fs::create_dir_all(&live).unwrap();
+    let j = Journal::plan(&live, Some(&tp.desktop_profile_dir("a")), None).unwrap();
+    assert!(j.moves.is_empty(), "the plan under test must be empty");
+
+    execute(&tp, j).unwrap();
+
+    assert!(tp.desktop_journal_file().exists());
 }
 
 #[test]
@@ -179,7 +234,7 @@ fn an_interruption_during_the_park_is_reversed_and_the_session_comes_back() {
     std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
     std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
 
-    let outcome = recover_if_interrupted(&tp).unwrap();
+    let outcome = recovered(&tp);
 
     assert_eq!(outcome, Some(Recovery::Reverse));
     assert_eq!(
@@ -196,7 +251,7 @@ fn an_interruption_during_the_park_is_reversed_and_the_session_comes_back() {
 #[test]
 fn no_journal_means_nothing_to_recover() {
     let tp = TestPaths::new().unwrap();
-    assert_eq!(recover_if_interrupted(&tp).unwrap(), None);
+    assert_eq!(recovered(&tp), None);
 }
 
 #[test]
@@ -209,7 +264,7 @@ fn a_journal_from_a_future_version_is_refused_rather_than_half_understood() {
     )
     .unwrap();
 
-    let err = recover_if_interrupted(&tp).unwrap_err();
+    let err = try_recover(&tp).unwrap_err();
     assert!(
         matches!(err, byte::Error::DesktopSwapInterrupted { .. }),
         "expected DesktopSwapInterrupted, got {err:?}"
@@ -251,7 +306,7 @@ fn rollforward_across_the_rename_journal_write_window_completes_and_clears_the_j
     std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
     std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
 
-    let outcome = recover_if_interrupted(&tp).unwrap();
+    let outcome = recovered(&tp);
 
     assert_eq!(outcome, Some(Recovery::RollForward));
     assert_eq!(marker(&live.join("Network")).as_deref(), Some("account-b"));
@@ -266,7 +321,7 @@ fn rollforward_across_the_rename_journal_write_window_completes_and_clears_the_j
     );
 
     // Safe to run again: nothing left to recover.
-    assert_eq!(recover_if_interrupted(&tp).unwrap(), None);
+    assert_eq!(recovered(&tp), None);
 }
 
 #[test]
@@ -290,7 +345,7 @@ fn reverse_across_the_rename_journal_write_window_restores_the_stranded_director
     std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
     std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
 
-    let outcome = recover_if_interrupted(&tp).unwrap();
+    let outcome = recovered(&tp);
 
     assert_eq!(outcome, Some(Recovery::Reverse));
     assert_eq!(
@@ -340,7 +395,7 @@ fn an_interruption_after_the_park_rolls_forward_and_finishes_the_remaining_insta
     std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
     std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
 
-    let outcome = recover_if_interrupted(&tp).unwrap();
+    let outcome = recovered(&tp);
 
     assert_eq!(outcome, Some(Recovery::RollForward));
     assert_eq!(
@@ -418,7 +473,7 @@ fn reverse_with_installs_pending_and_no_rename_yet_leaves_both_profiles_where_th
     std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
     std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
 
-    let outcome = recover_if_interrupted(&tp).unwrap();
+    let outcome = recovered(&tp);
 
     assert_eq!(outcome, Some(Recovery::Reverse));
     assert_eq!(marker(&live.join("Network")).as_deref(), Some("account-a"));
@@ -491,7 +546,7 @@ fn reverse_mid_park_with_installs_pending_restores_every_live_directory() {
     std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
     std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
 
-    let outcome = recover_if_interrupted(&tp).unwrap();
+    let outcome = recovered(&tp);
 
     assert_eq!(outcome, Some(Recovery::Reverse));
     assert_eq!(
@@ -540,12 +595,9 @@ fn a_reversed_swap_with_installs_pending_is_not_recovered_a_second_time() {
     std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
     std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
 
+    assert_eq!(recovered(&tp), Some(Recovery::Reverse));
     assert_eq!(
-        recover_if_interrupted(&tp).unwrap(),
-        Some(Recovery::Reverse)
-    );
-    assert_eq!(
-        recover_if_interrupted(&tp).unwrap(),
+        recovered(&tp),
         None,
         "the repair must be finished after one pass, not repeated forever"
     );
@@ -593,7 +645,7 @@ fn reverse_undoes_an_install_whose_rename_landed_but_was_never_recorded() {
 
     std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
 
-    let outcome = recover_if_interrupted(&tp).unwrap();
+    let outcome = recovered(&tp);
 
     assert_eq!(outcome, Some(Recovery::Reverse));
     assert_eq!(
@@ -615,5 +667,406 @@ fn reverse_undoes_an_install_whose_rename_landed_but_was_never_recorded() {
         !park.join("Network").exists(),
         "a fully reversed park leaves nothing behind in the outgoing store"
     );
+    assert!(!tp.desktop_journal_file().exists());
+}
+
+// ---------------------------------------------------------------------------
+// The journal's commit boundary. A swap is roughly sixteen renames AND a
+// patch of three keys in the desktop app's `config.json`; recovery that
+// finishes only the renames leaves the app authenticating as one account
+// over another account's cookie jar, with no journal left to say so.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rolling_forward_leaves_the_config_naming_the_incoming_account() {
+    // The window: a crash after the first completed install and before the
+    // journal is cleared. Recovery finishes the remaining installs, so the
+    // incoming account's cookies are live -- but `config.json` still holds
+    // the OUTGOING account's token cache and `lastKnownAccountUuid`, and the
+    // command that ran the repair tells the user it is done.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let live = dp.desktop_dir();
+    let park = tp.desktop_profile_dir("uuid-a");
+    let take = tp.desktop_profile_dir("uuid-b");
+    seed(&live, &[("Network", "account-a")]);
+    seed(
+        &take,
+        &[("Network", "account-b"), ("IndexedDB", "account-b")],
+    );
+
+    // The live config, as the interrupted swap left it: still account a's.
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({
+            "lastKnownAccountUuid": "uuid-a",
+            "oauth:tokenCacheV2": {"accessToken": "a-token"},
+            "locale": "en-GB"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // b's stored identity, waiting in its profile directory for the patch
+    // that never ran.
+    std::fs::write(
+        take.join("oauth.json"),
+        serde_json::json!({
+            "oauth": {"oauth:tokenCacheV2": {"accessToken": "b-token"}},
+            "account_uuid": "uuid-b"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut j = Journal::plan(&live, Some(&park), Some(&take)).unwrap();
+    j.outgoing = Some("uuid-a".to_string());
+    j.incoming = Some("uuid-b".to_string());
+
+    // Park completes, one install completes, then the process dies.
+    let park_index = move_index(&j, Stage::Park, "Network");
+    std::fs::create_dir_all(&park).unwrap();
+    std::fs::rename(&j.moves[park_index].from, &j.moves[park_index].to).unwrap();
+    j.mark_done(park_index);
+    let done_install = move_index(&j, Stage::Install, "Network");
+    std::fs::rename(&j.moves[done_install].from, &j.moves[done_install].to).unwrap();
+    j.mark_done(done_install);
+
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let repair = recover_if_interrupted(&tp, Some(&dp)).unwrap().unwrap();
+
+    assert_eq!(repair.recovery, Recovery::RollForward);
+    assert_eq!(
+        marker(&live.join("IndexedDB")).as_deref(),
+        Some("account-b")
+    );
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert_eq!(
+        cfg["lastKnownAccountUuid"],
+        serde_json::json!("uuid-b"),
+        "the repair is not finished while the app still reports the outgoing account"
+    );
+    assert_eq!(
+        cfg["oauth:tokenCacheV2"],
+        serde_json::json!({"accessToken": "b-token"}),
+        "the app must authenticate from the account whose cookies are now live"
+    );
+    assert_eq!(cfg["locale"], serde_json::json!("en-GB"));
+    assert!(!tp.desktop_journal_file().exists());
+}
+
+#[test]
+fn rolling_forward_into_an_account_with_nothing_stored_signs_the_app_out() {
+    // The `NoProfileForIncoming` shape, interrupted: the journal names no
+    // incoming account because there was no stored profile to install. The
+    // repair must finish what `switch_desktop` would have done -- clear the
+    // keys -- rather than leave the outgoing account's identity in place.
+    //
+    // Reached with a hand-built journal because a real plan with no incoming
+    // account has no `Install` moves, and so always reverses.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let live = dp.desktop_dir();
+    let park = tp.desktop_profile_dir("uuid-a");
+    seed(&live, &[("Network", "account-a")]);
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({"lastKnownAccountUuid": "uuid-a", "locale": "en-GB"}).to_string(),
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(&park).unwrap();
+    let j = Journal {
+        version: 1,
+        outgoing: Some("uuid-a".to_string()),
+        incoming: None,
+        moves: vec![Move {
+            stage: Stage::Install,
+            from: park.join("nothing"),
+            to: live.join("nothing"),
+            done: true,
+        }],
+    };
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let repair = recover_if_interrupted(&tp, Some(&dp)).unwrap().unwrap();
+
+    assert_eq!(repair.recovery, Recovery::RollForward);
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert!(
+        cfg.get("lastKnownAccountUuid").is_none(),
+        "nothing was installed, so the app must end up signed out, not still naming a"
+    );
+    assert_eq!(cfg["locale"], serde_json::json!("en-GB"));
+    assert!(!tp.desktop_journal_file().exists());
+}
+
+#[test]
+fn reversing_leaves_a_config_that_already_describes_the_restored_session_alone() {
+    // A reversal's `config.json` was never patched -- the patch runs after
+    // every rename, so a swap that did not get that far still names the
+    // outgoing account. Restoring its parked keys over it is then a no-op,
+    // and byte must not rewrite a file it does not own to achieve nothing:
+    // a repair runs at the start of every command, so an unnecessary write
+    // here is an unnecessary backup, rewrite and verify every time, on a
+    // file that may not even be writable.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let live = dp.desktop_dir();
+    let park = tp.desktop_profile_dir("uuid-a");
+    seed(
+        &live,
+        &[("Network", "account-a"), ("IndexedDB", "account-a")],
+    );
+
+    let before = serde_json::json!({
+        "lastKnownAccountUuid": "uuid-a",
+        "oauth:tokenCacheV2": {"accessToken": "a-token"},
+        "locale": "en-GB"
+    })
+    .to_string();
+    std::fs::write(dp.config_file(), &before).unwrap();
+    std::fs::create_dir_all(&park).unwrap();
+    std::fs::write(
+        park.join("oauth.json"),
+        serde_json::json!({
+            "oauth": {"oauth:tokenCacheV2": {"accessToken": "a-token"}},
+            "account_uuid": "uuid-a"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut j = Journal::plan(&live, Some(&park), None).unwrap();
+    j.outgoing = Some("uuid-a".to_string());
+    // One entry parked, one still outstanding: the park is genuinely
+    // half-done, which is what makes this a reversal at all.
+    let parked = move_index(&j, Stage::Park, "Network");
+    std::fs::rename(&j.moves[parked].from, &j.moves[parked].to).unwrap();
+    j.mark_done(parked);
+    assert!(
+        !j.is_complete(),
+        "the window under test is a half-done park"
+    );
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let repair = recover_if_interrupted(&tp, Some(&dp)).unwrap().unwrap();
+
+    assert_eq!(repair.recovery, Recovery::Reverse);
+    assert_eq!(repair.identity, IdentityRepair::Restored);
+    assert_eq!(marker(&live.join("Network")).as_deref(), Some("account-a"));
+    assert_eq!(
+        std::fs::read_to_string(dp.config_file()).unwrap(),
+        before,
+        "a config that already describes the restored session must be byte-for-byte untouched"
+    );
+    assert!(
+        !tp.backup_dir().join("config.json").exists()
+            && std::fs::read_dir(tp.backup_dir())
+                .map(|d| d.flatten().count())
+                .unwrap_or(0)
+                == 0,
+        "and no backup churn for a write that did not happen"
+    );
+}
+
+#[test]
+fn a_repair_that_cannot_reach_the_config_keeps_the_journal_and_says_so() {
+    // `RealDesktopPaths::discover` fails when neither `CLAUDE_DESKTOP_DIR`
+    // nor `%APPDATA%` is set. Recovery must still put the directories back
+    // where they belong -- that half needs no desktop paths at all -- and
+    // must NOT clear the journal, because the identity half is still
+    // outstanding and only a later command can finish it.
+    let tp = TestPaths::new().unwrap();
+    let live = tp.root().join("Claude");
+    let park = tp.desktop_profile_dir("uuid-a");
+    seed(
+        &live,
+        &[("Network", "account-a"), ("IndexedDB", "account-a")],
+    );
+
+    let mut j = Journal::plan(&live, Some(&park), None).unwrap();
+    j.outgoing = Some("uuid-a".to_string());
+    std::fs::create_dir_all(&park).unwrap();
+    let parked = move_index(&j, Stage::Park, "Network");
+    std::fs::rename(&j.moves[parked].from, &j.moves[parked].to).unwrap();
+    j.mark_done(parked);
+    assert!(
+        !j.is_complete(),
+        "the window under test is a half-done park"
+    );
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let repair = recover_if_interrupted(&tp, None::<&TestDesktopPaths>)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(repair.recovery, Recovery::Reverse);
+    assert_eq!(
+        repair.identity,
+        IdentityRepair::Deferred,
+        "the caller has to be able to say what was left unfinished"
+    );
+    assert_eq!(
+        marker(&live.join("Network")).as_deref(),
+        Some("account-a"),
+        "the directory half needs no desktop paths and must still be repaired"
+    );
+    assert!(
+        tp.desktop_journal_file().exists(),
+        "an unfinished identity half must leave the journal for a later command"
+    );
+}
+
+#[test]
+fn a_forward_move_with_neither_end_present_is_an_error() {
+    // `apply_move` classifies the pair (source present, destination present)
+    // before renaming, and only the exact "source gone, destination there"
+    // shape may be treated as an already-applied no-op. With NEITHER end
+    // present something is genuinely wrong and the OS's own error is the
+    // honest answer -- papering over it would mark a move done that never
+    // happened and clear the journal that records it.
+    let tp = TestPaths::new().unwrap();
+    let j = Journal {
+        version: 1,
+        outgoing: None,
+        incoming: None,
+        moves: vec![Move {
+            stage: Stage::Park,
+            from: tp.root().join("gone/Network"),
+            to: tp.root().join("store/Network"),
+            done: false,
+        }],
+    };
+
+    let err = execute(&tp, j).unwrap_err();
+
+    assert!(
+        matches!(err, byte::Error::Io { .. }),
+        "expected the missing source's io error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_backward_move_with_neither_end_present_is_an_error() {
+    // The undo direction's half of the same classification. Reversing a move
+    // whose two ends are both empty cannot be a no-op success: the directory
+    // that move was carrying is not at either end, so recovery has lost it
+    // and must say so rather than clear the journal that names it.
+    let tp = TestPaths::new().unwrap();
+    // A second, outstanding move keeps this a reversal (a journal with
+    // nothing left outstanding rolls forward instead) and is itself an
+    // ordinary never-ran park, both of whose ends are still occupied.
+    seed(&tp.root().join("live"), &[("IndexedDB", "account-a")]);
+    seed(&tp.root().join("store"), &[("IndexedDB", "stale")]);
+    let j = Journal {
+        version: 1,
+        outgoing: None,
+        incoming: None,
+        moves: vec![
+            Move {
+                stage: Stage::Park,
+                from: tp.root().join("gone/Network"),
+                to: tp.root().join("store/Network"),
+                done: true,
+            },
+            Move {
+                stage: Stage::Park,
+                from: tp.root().join("live/IndexedDB"),
+                to: tp.root().join("store/IndexedDB"),
+                done: false,
+            },
+        ],
+    };
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let err = recover_if_interrupted(&tp, None::<&TestDesktopPaths>).unwrap_err();
+
+    assert!(
+        matches!(err, byte::Error::Io { .. }),
+        "expected the missing source's io error, got: {err:?}"
+    );
+}
+
+#[test]
+fn a_journal_with_nothing_outstanding_rolls_forward_even_with_no_installs() {
+    // Switching into an account with nothing stored plans parks and no
+    // installs at all, so the "any install completed" test can never fire
+    // for it. Without a completeness test as well, such a journal reverses
+    // -- and the window it can be found in is no longer only a crash: the
+    // journal now also covers the `config.json` patch, which fails on
+    // ordinary conditions. Reversing there would put the outgoing account's
+    // session back and quietly undo a switch that had already happened.
+    let j = Journal {
+        version: 1,
+        outgoing: Some("uuid-a".to_string()),
+        incoming: None,
+        moves: vec![Move {
+            stage: Stage::Park,
+            from: "/live/Network".into(),
+            to: "/store/Network".into(),
+            done: true,
+        }],
+    };
+
+    assert_eq!(recovery_for(&j), Recovery::RollForward);
+}
+
+#[test]
+fn a_park_only_swap_whose_patch_failed_is_finished_not_undone() {
+    // The same rule end to end, in the shape that produces it: every rename
+    // landed, the app's account keys did not get cleared, and the next
+    // command has to finish that -- not put the outgoing account's profile
+    // back where it started.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let live = dp.desktop_dir();
+    let park = tp.desktop_profile_dir("uuid-a");
+    seed(&live, &[("Network", "account-a")]);
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({
+            "lastKnownAccountUuid": "uuid-a",
+            "oauth:tokenCacheV2": {"accessToken": "a-token"},
+            "locale": "en-GB"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut j = Journal::plan(&live, Some(&park), None).unwrap();
+    j.outgoing = Some("uuid-a".to_string());
+    std::fs::create_dir_all(&park).unwrap();
+    for index in 0..j.moves.len() {
+        std::fs::rename(&j.moves[index].from, &j.moves[index].to).unwrap();
+        j.mark_done(index);
+    }
+    assert!(j.is_complete());
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let repair = recover_if_interrupted(&tp, Some(&dp)).unwrap().unwrap();
+
+    assert_eq!(repair.recovery, Recovery::RollForward);
+    assert_eq!(
+        marker(&park.join("Network")).as_deref(),
+        Some("account-a"),
+        "the completed park must stay parked, not be undone"
+    );
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert!(
+        cfg.get("lastKnownAccountUuid").is_none(),
+        "the patch that never ran is what the repair had to finish"
+    );
+    assert!(cfg.get("oauth:tokenCacheV2").is_none());
+    assert_eq!(cfg["locale"], serde_json::json!("en-GB"));
     assert!(!tp.desktop_journal_file().exists());
 }

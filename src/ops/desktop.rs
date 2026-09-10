@@ -26,30 +26,114 @@ pub enum DesktopOutcome {
     /// the app is now signed out and waiting for a login to capture.
     NoProfileForIncoming,
     /// The live desktop session belongs to a different account than the one
-    /// byte was about to file it under; nothing was touched. See the guard
-    /// in [`switch_desktop`] for how the two halves drift apart.
+    /// byte was about to file it under; nothing was touched. See
+    /// [`park_target`] for how the two halves drift apart.
     IdentityMismatch,
+    /// The incoming profile was installed, but the account's stored
+    /// `oauth.json` could not be read, so the app was left signed out rather
+    /// than authenticating as the account whose session just moved away.
+    SwitchedWithoutIdentity,
     /// No outgoing account and nothing stored: there was nothing to move.
     NothingToDo,
 }
 
-/// Does the live desktop session belong to `expected`?
+/// Which account's store the live profile should be filed under.
+enum ParkTarget {
+    /// File it under this uuid.
+    Under(String),
+    /// There is no session to file.
+    Nothing,
+    /// byte cannot tell whose session this is, or it is not the one it was
+    /// told to expect. Touch nothing.
+    Refuse,
+}
+
+/// Decide whose store the live desktop profile belongs in, from what
+/// `config.json` actually says rather than from `outgoing` alone.
 ///
-/// An ABSENT `lastKnownAccountUuid` is not a mismatch: there is no session
-/// to misfile, and parking a signed-out profile under the outgoing account
-/// is harmless -- that is the ordinary state of a desktop app the user has
-/// never signed into, and refusing there would break the first switch on
-/// every fresh machine. An explicit JSON `null` is read the same way, since
-/// it carries no identity either.
+/// `outgoing` comes from the CLI's sync-back -- it names whichever account
+/// Claude CODE was on -- and the two halves drift apart routinely: the tray
+/// switches Claude Code without touching the desktop app, and a user can
+/// sign into Claude Desktop by hand at any time. Filing the wrong way round
+/// writes one account's cookies into another account's directory, so a later
+/// switch INTO that other account installs this account's session and
+/// applies its identity. Nothing on disk changes on a refusal: it costs
+/// nothing and loses nothing.
 ///
-/// A value that is present but not a string cannot equal `expected` and so
-/// is a mismatch: byte would be about to file a session whose identity it
-/// cannot even read.
-fn identity_matches(live: &config::DesktopOauth, expected: &str) -> bool {
-    match live.account_uuid.as_ref() {
-        None | Some(serde_json::Value::Null) => true,
-        Some(v) => v.as_str() == Some(expected),
+/// Two cases are worth spelling out, because each was a finding.
+///
+/// `outgoing` is `None` -- Claude Code is logged out, or freshly installed
+/// -- but `config.json` names an account. Reading that as "no session to
+/// park" plans no park at all, leaves the live directory's contents in
+/// place, and lands the incoming account's install moves on top of them:
+/// where the entry sets overlap the rename fails with a bare io error, and
+/// where they are disjoint it SUCCEEDS and stamps the incoming account's
+/// identity over a directory still holding the previous account's cookies.
+/// The app itself knows whose session it is; byte parks it under that uuid.
+///
+/// An ABSENT `lastKnownAccountUuid` used to be waved through unconditionally
+/// on the premise that a signed-out profile is harmless to file under the
+/// outgoing account. That premise holds only while `<store>/<outgoing>` is
+/// empty -- and byte manufactures the violating state itself: `config::clear`
+/// removes `lastKnownAccountUuid` at the very moment the park fills that
+/// directory with a real profile. Over a store that already holds a session,
+/// an absent uuid is a drift signal, not a green light.
+fn park_target(
+    paths: &impl HostPaths,
+    outgoing: Option<&str>,
+    live: &config::DesktopOauth,
+) -> Result<ParkTarget> {
+    let identity = live.identity();
+
+    let Some(expected) = outgoing else {
+        return Ok(match identity {
+            config::Identity::Absent => ParkTarget::Nothing,
+            config::Identity::Account(uuid) => ParkTarget::Under(uuid),
+            config::Identity::Unreadable => ParkTarget::Refuse,
+        });
+    };
+
+    Ok(match identity {
+        config::Identity::Account(uuid) if uuid == expected => ParkTarget::Under(uuid),
+        config::Identity::Account(_) | config::Identity::Unreadable => ParkTarget::Refuse,
+        // No identity: a desktop app that has never been signed in, or one
+        // byte itself signed out. Only the first is safe to file, and an
+        // empty store is what tells them apart. Refusing whenever the store
+        // is empty instead would break the first switch on every fresh
+        // machine.
+        config::Identity::Absent => {
+            let stored = profile::movable_entries(&paths.desktop_profile_dir(expected))?;
+            if stored.is_empty() {
+                ParkTarget::Under(expected.to_string())
+            } else {
+                ParkTarget::Refuse
+            }
+        }
+    })
+}
+
+/// Does an account's store already hold a desktop session?
+///
+/// Either half counts. A park files two things side by side -- the profile
+/// directories, and the `oauth.json` byte captured from `config.json` -- and
+/// a park can produce one without the other: a live directory whose every
+/// entry is denylisted stores real keys and no directories at all. Losing
+/// either loses the account's desktop session, so the question is not "are
+/// there directories" but "is there anything of that account here".
+///
+/// An `oauth.json` byte cannot read counts as a session: the point of the
+/// caller's guard is to refuse when byte cannot tell, and treating an
+/// unreadable file as empty would let the one write that destroys it
+/// through.
+fn store_holds_a_session(dir: &Path) -> Result<bool> {
+    if !profile::movable_entries(dir)?.is_empty() {
+        return Ok(true);
     }
+    Ok(match config::read_stored(&dir.join("oauth.json")) {
+        config::StoredOauth::Absent => false,
+        config::StoredOauth::Unreadable(_) => true,
+        config::StoredOauth::Loaded(oauth) => !oauth.is_empty(),
+    })
 }
 
 /// Total size of a directory tree, for the stored-profile record.
@@ -136,36 +220,40 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
     }
 
     let live = desktop.desktop_dir();
-    let park_to = outgoing.map(|uuid| paths.desktop_profile_dir(uuid));
-    let install_from = paths.desktop_profile_dir(incoming);
 
-    // The outgoing account's OAuth keys are read BEFORE any rename runs.
-    // Order is load-bearing: once the swap starts, `config.json` is about to
-    // be overwritten with the incoming account's values, so capturing
-    // afterwards would read back the wrong account -- and a failure mid-swap
-    // would lose the outgoing account's identity entirely, leaving its
-    // parked cookies unusable. Read once, used twice: by the identity guard
-    // immediately below, and by the park that writes it out further down.
-    let outgoing_oauth = match outgoing {
-        Some(_) => Some(config::capture(&desktop.config_file())?),
-        None => None,
+    // The live OAuth keys are read BEFORE any rename runs, and
+    // UNCONDITIONALLY -- not only when Claude Code names an outgoing
+    // account. Order is load-bearing: once the swap starts, `config.json` is
+    // about to be overwritten with the incoming account's values, so
+    // capturing afterwards would read back the wrong account, and a failure
+    // mid-swap would lose the outgoing account's identity entirely, leaving
+    // its parked cookies unusable. Reading it unconditionally is what lets
+    // `park_target` answer from the app's own record of whose session this
+    // is, rather than from a parameter that describes the OTHER half of the
+    // switch. Read once, used three times: to decide the park target, to
+    // guard the write below, and as the content of that write.
+    let live_oauth = config::capture(&desktop.config_file())?;
+
+    let park_under = match park_target(paths, outgoing, &live_oauth)? {
+        ParkTarget::Refuse => return Ok(DesktopOutcome::IdentityMismatch),
+        ParkTarget::Nothing => None,
+        ParkTarget::Under(uuid) => Some(uuid),
     };
 
-    // Refuse to file one account's live session under another account's
-    // uuid. `outgoing` comes from the CLI's sync-back -- it names whichever
-    // account Claude CODE was on -- and the two halves can drift apart: the
-    // tray switches Claude Code without touching the desktop app at all, and
-    // a user can sign into Claude Desktop by hand at any time. When they
-    // have drifted, parking would write the live account's cookies into
-    // `<store>/<other-uuid>/` and its keys into that directory's
-    // `oauth.json`, so a later switch INTO that other account would install
-    // this account's session and apply its identity. Nothing on disk changes
-    // here: a refusal costs nothing and loses nothing.
-    if let (Some(uuid), Some(oauth)) = (outgoing, outgoing_oauth.as_ref())
-        && !identity_matches(oauth, uuid)
-    {
-        return Ok(DesktopOutcome::IdentityMismatch);
+    // The self-switch guard again, now that the outgoing side is known from
+    // the app rather than from Claude Code. Claude Code being logged out
+    // while the desktop app is already signed in as the incoming account is
+    // an ordinary state, and there is nothing to do for it: parking into the
+    // directory the swap would install from is exactly the collision the
+    // guard at the top of this function exists to prevent.
+    if park_under.as_deref() == Some(incoming) {
+        return Ok(DesktopOutcome::NothingToDo);
     }
+
+    let park_to = park_under
+        .as_deref()
+        .map(|uuid| paths.desktop_profile_dir(uuid));
+    let install_from = paths.desktop_profile_dir(incoming);
 
     // "Is there a stored profile?" is decided on whether the directory holds
     // anything that MOVES, not on the directory existing -- because this very
@@ -182,12 +270,26 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
 
     // The keys read above are written into the parked directory before the
     // first rename, for the ordering reason given at that read.
-    if let (Some(park_to), Some(outgoing_oauth)) = (park_to.as_deref(), outgoing_oauth.as_ref()) {
+    if let Some(park_to) = park_to.as_deref() {
+        // The last guard before an irreplaceable file is overwritten, and a
+        // different question from `park_target`'s. That one asks whose store
+        // this profile belongs in, and answers from the parked DIRECTORIES.
+        // This one asks whether the write is about to destroy a session, and
+        // answers from the parked KEYS -- which a park can legitimately
+        // store without any directories at all. `oauth.json` is in no
+        // journal, so no recovery ever repairs it: replacing real keys with
+        // `{null,null,null}` simply loses that account's desktop token. An
+        // empty capture over a store that still holds a session means the
+        // live directory is not the session byte thinks it is.
+        if live_oauth.is_empty() && store_holds_a_session(park_to)? {
+            return Ok(DesktopOutcome::IdentityMismatch);
+        }
+
         std::fs::create_dir_all(park_to).map_err(|source| Error::Io {
             path: park_to.to_path_buf(),
             source,
         })?;
-        let bytes = serde_json::to_vec_pretty(&outgoing_oauth).map_err(|source| Error::Parse {
+        let bytes = serde_json::to_vec_pretty(&live_oauth).map_err(|source| Error::Parse {
             path: park_to.join("oauth.json"),
             source,
         })?;
@@ -200,17 +302,18 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
         has_incoming.then_some(install_from.as_path()),
     )?;
     // `Journal::plan` only knows paths, not account identities, so it always
-    // hands back `outgoing`/`incoming` as `None` (task-3 carry-forward).
-    // Filled in here, before the journal is ever persisted, so that a
-    // recovery hitting this journal mid-swap can report which two accounts
-    // it was between. Mirrors the Option-ness already decided above rather
-    // than guessing at new semantics: `None` means this swap genuinely has
-    // no such side (no outgoing account at all; no stored profile to
-    // install), matching `park_to`/`install_from`.
-    journal.outgoing = outgoing.map(str::to_string);
+    // hands back `outgoing`/`incoming` as `None`. Filled in here, before the
+    // journal is ever persisted, because they are what a later recovery uses
+    // to finish the identity half of this swap: which account's parked
+    // `oauth.json` belongs in `config.json` depends entirely on which way
+    // the repair goes. `None` means this swap genuinely has no such side (no
+    // session to park; no stored profile to install), matching
+    // `park_to`/`install_from` -- and `outgoing` is the DERIVED park target,
+    // not the parameter, because that is whose session actually moved.
+    journal.outgoing = park_under.clone();
     journal.incoming = has_incoming.then(|| incoming.to_string());
 
-    if journal.moves.is_empty() && !has_incoming && outgoing.is_none() {
+    if journal.moves.is_empty() && !has_incoming && park_under.is_none() {
         return Ok(DesktopOutcome::NothingToDo);
     }
 
@@ -218,26 +321,60 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
 
     // The config patch follows the moves, not the other way round: if the
     // moves fail, the app's identity should still name whatever session is
-    // actually in place.
+    // actually in place. It runs INSIDE the journal's commit boundary --
+    // `execute` no longer clears the journal, and `clear_journal` below runs
+    // only once this patch has landed. A crash or an `Err` anywhere in here
+    // therefore leaves the journal on disk, and the next byte command
+    // finishes the patch through `swap::recover_if_interrupted` instead of
+    // leaving the app authenticating as one account over another's cookies.
     let backups = paths.backup_dir();
+    let config_file = desktop.config_file();
     let outcome = if has_incoming {
         let stored = install_from.join("oauth.json");
-        let oauth = match std::fs::read(&stored) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => config::DesktopOauth::default(),
-        };
-        config::apply(&desktop.config_file(), &oauth, &backups)?;
-        DesktopOutcome::Switched
+        match config::read_stored(&stored) {
+            config::StoredOauth::Loaded(oauth) => {
+                config::apply(&config_file, &oauth, &backups)?;
+                DesktopOutcome::Switched
+            }
+            // No file at all: a profile parked by a build older than the one
+            // that started writing `oauth.json`. Its cookies still restore;
+            // it simply has no identity recorded, so the app opens signed
+            // out and byte captures the next login.
+            config::StoredOauth::Absent => {
+                config::clear(&config_file, &backups)?;
+                DesktopOutcome::Switched
+            }
+            // Present and unreadable. Defaulting silently -- which is what
+            // `unwrap_or_default` did -- installs the account's cookies and
+            // then signs the app out of them, while reporting a clean
+            // switch. The swap has committed, so this must not become an
+            // `Err`; it becomes an outcome of its own, and a warning naming
+            // the file, so the stderr message and `--json` both say what
+            // actually happened.
+            config::StoredOauth::Unreadable(reason) => {
+                config::clear(&config_file, &backups)?;
+                output::warn(&format!(
+                    "the desktop session for this account was restored, but its saved sign-in \
+                     at {} could not be read ({reason}), so Claude Desktop will open signed \
+                     out. Sign in there once and byte will capture it again.",
+                    stored.display()
+                ));
+                DesktopOutcome::SwitchedWithoutIdentity
+            }
+        }
     } else {
         // Signed out: the user logs in as the new account and byte captures.
-        config::clear(&desktop.config_file(), &backups)?;
+        config::clear(&config_file, &backups)?;
         DesktopOutcome::NoProfileForIncoming
     };
+
+    // Both halves have landed, so the swap is over and its record goes.
+    swap::clear_journal(paths)?;
 
     // Bookkeeping comes LAST, after both halves of the switch have landed,
     // because it is the only step whose failure must not be allowed to
     // matter. See `record_parked_profile`.
-    if let (Some(uuid), Some(park_to)) = (outgoing, park_to.as_deref()) {
+    if let (Some(uuid), Some(park_to)) = (park_under.as_deref(), park_to.as_deref()) {
         record_parked_profile(paths, uuid, park_to);
     }
 

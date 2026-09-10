@@ -30,7 +30,7 @@ src/
     paths.rs       DesktopPaths trait; RealDesktopPaths (the app's real %APPDATA%\Claude) and TestDesktopPaths (tempdir)
     profile.rs     classifies one entry in the app's data directory as Move / Patch / Leave (pure, denylist-based)
     journal.rs     Journal/Move/Stage types, Journal::plan (parks before installs), JSON (de)serialization (pure)
-    config.rs      the three config.json keys byte owns (oauth:tokenCache, oauth:tokenCacheV2, lastKnownAccountUuid), patched via JsonDocument
+    config.rs      the config.json state byte owns (every top-level oauth: key, plus lastKnownAccountUuid), patched via JsonDocument; also reads back the oauth.json it parks
     swap.rs        create_store_dir; executing a planned journal (execute) and repairing an interrupted one (recover_if_interrupted) against the real filesystem
   ops/
     switch.rs      Switcher — capture, sync-back, switch (the core algorithm)
@@ -68,7 +68,8 @@ main.rs
         │     ├── claude::detect   (the running-sessions notification)
         │     └── lock (MutationGuard, InstanceGuard)
         └── a command: ops (switch, add, manage, desktop) / autostart
-              ├── desktop::paths   (RealDesktopPaths::discover, Command::Switch only)
+              ├── desktop::paths   (RealDesktopPaths::discover, once per run —
+              │                     recovery needs it as much as Command::Switch does)
               ├── claude::detect   (the running-sessions warning)
               └── lock (MutationGuard, mutating commands only)
 
@@ -86,7 +87,8 @@ ops::desktop (switch_desktop — called from cli::run::cmd_switch only after
   └── paths            (HostPaths — byte's OWN config dir, not the app's)
 
 desktop::config
-  └── claude::document (JsonDocument — patches config.json's three owned keys)
+  └── claude::document (JsonDocument — patches config.json's oauth: keys
+                        and lastKnownAccountUuid, leaving everything else)
 
 error, output, paths, atomic
   are used from every layer above them
@@ -173,21 +175,38 @@ error, output, paths, atomic
   reassembled and validated together — see "Command flow" below.
 - **`Journal`** (`desktop/journal.rs`) — the whole planned sequence of
   directory renames for one desktop-profile swap, as `Move { stage, from,
-  to, done }` entries. Written to disk in full, via `desktop::swap`, before
-  the first rename runs, and deleted only once every move has completed;
-  this is what lets `desktop::swap::recover_if_interrupted` repair a swap a
-  crash left half-done, on whichever byte command runs next rather than
-  only a retry of `switch`.
-- **`DesktopOauth`** (`desktop/config.rs`) — the three keys byte owns inside
-  the desktop app's `config.json` (`oauth:tokenCache`, `oauth:tokenCacheV2`,
-  `lastKnownAccountUuid`), each `Option` so that restoring an account that
-  predates a given key removes it rather than leaving the previous
-  account's value in place.
+  to, done }` entries, plus the `outgoing`/`incoming` account uuids the swap
+  is between. Written to disk in full, via `desktop::swap`, before the first
+  rename runs, and deleted only once **both** halves of the swap have
+  landed: every move, and the patch of the app's own `config.json`.
+  `swap::execute` deliberately returns with it still on disk, and
+  `ops::desktop::switch_desktop` clears it after the patch — so a patch that
+  fails leaves a record for the next command instead of a directory tree
+  belonging to one account under another account's identity. This is what
+  lets `desktop::swap::recover_if_interrupted` repair a swap a crash left
+  half-done, on whichever byte command runs next rather than only a retry of
+  `switch`, and the `outgoing`/`incoming` fields are what tell it whose
+  `oauth.json` to restore.
+- **`DesktopOauth`** (`desktop/config.rs`) — the account state byte owns
+  inside the desktop app's `config.json`: every top-level key beginning
+  `oauth:`, kept as a set under its real key names, plus
+  `lastKnownAccountUuid`. A prefix rather than a list, for the same reason
+  `desktop::profile` uses a denylist — `oauth:tokenCache` →
+  `oauth:tokenCacheV2` already happened once, and a key an allowlist has
+  never heard of would be left behind for the *next* account to authenticate
+  from. A key the incoming account does not carry is removed rather than
+  left holding the previous account's value.
 - **`DesktopOutcome`** (`ops/desktop.rs`) — what `switch_desktop` managed to
   do: `Switched`, `AppRunning`, `NoProfileForIncoming`, `IdentityMismatch`,
-  or `NothingToDo`. Returned as `Ok`, never as a failure that would
-  propagate past the Claude Code switch that already committed by the time
-  `switch_desktop` runs — see the `ops::desktop` bullet above.
+  `SwitchedWithoutIdentity`, or `NothingToDo`. Returned as `Ok`, never as a
+  failure that would propagate past the Claude Code switch that already
+  committed by the time `switch_desktop` runs — see the `ops::desktop`
+  bullet above.
+- **`Repair`** (`desktop/swap.rs`) — what `recover_if_interrupted` managed
+  to finish: a `Recovery` (`RollForward`/`Reverse`) for the renames, and an
+  `IdentityRepair` for the `config.json` patch. The two fail independently,
+  and `Deferred` — no desktop paths available this run — is the one answer
+  that keeps the journal on disk.
 
 ## Command flow, end to end
 
@@ -205,10 +224,12 @@ error, output, paths, atomic
    (`switch`, `capture`, `add`, `remove`, `rename`) that arm first takes
    `lock::MutationGuard`, so a concurrent tray-driven switch cannot
    interleave its writes with this one; `list`, `current`, and `autostart`
-   never take it. For `Command::Switch` specifically, it also tries
-   `RealDesktopPaths::discover()`, degrading to "no desktop half attempted"
+   never take it. `RealDesktopPaths::discover()` is resolved once at the
+   very top of `run`, before step 2, degrading to "no desktop app located"
    rather than failing the command when no desktop app directory can be
-   found (the ordinary state on every non-Windows machine).
+   found (the ordinary state on every non-Windows machine). It has to be
+   resolved that early because recovery in step 2 needs it too: an
+   interrupted swap's unfinished half may be the app's own `config.json`.
 4. `cmd_switch` calls `Switcher::switch_to("work")`, which: resolves `"work"`
    against `accounts.json` before touching anything; syncs the currently
    live account back to the store so a token Claude Code rotated isn't lost;
@@ -224,9 +245,14 @@ error, output, paths, atomic
    `cmd_switch` calls `ops::desktop::switch_desktop`, which parks the
    outgoing account's live desktop session into its store, installs the
    incoming account's stored session if one exists (or leaves the app
-   signed out if not), and patches `config.json`'s three owned keys to
-   match — all through a `Journal` (above) so a crash partway through is
-   repaired rather than left half-applied. Its `DesktopOutcome` is reported
+   signed out if not), and patches `config.json`'s owned keys to match --
+   all through a `Journal` (above), which is cleared only once that patch
+   has landed, so a crash *or an ordinary write failure* partway through is
+   repaired by the next command rather than left half-applied. Which account
+   the live session is parked under is decided from `config.json`'s own
+   `lastKnownAccountUuid`, not from the account Claude Code was on: the two
+   drift apart routinely, and byte refuses rather than guessing when it
+   cannot tell whose session it is looking at. Its `DesktopOutcome` is reported
    but can never turn the switch in step 4 into a failure — see the
    `ops::desktop` bullet under "Dependency direction" above.
 6. `cmd_switch` renders the outcome of both halves — either as JSON on
@@ -258,7 +284,8 @@ error, output, paths, atomic
   renames, not one file write, so it cannot use `atomic.rs`'s single-write
   guarantee. `desktop::journal::Journal` supplies the equivalent for that
   shape: the entire planned sequence is written to disk before the first
-  rename runs, updated as each one completes, and cleared only on success.
+  rename runs, updated as each one completes, and cleared only once the
+  whole swap -- renames AND the app's `config.json` patch -- has succeeded.
   `desktop::swap::recover_if_interrupted` replays or reverses whatever it
   finds at the start of every byte command (via `cli::run::recover_under_lock`),
   not only on a retry of `switch` — see the `Journal` bullet above.
