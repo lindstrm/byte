@@ -1,5 +1,6 @@
 use byte::claude::detect::FakeProbe;
 use byte::claude::snapshot::AccountSnapshot;
+use byte::desktop::journal::Journal;
 use byte::desktop::paths::{DesktopPaths, TestDesktopPaths};
 use byte::ops::desktop::{DesktopOutcome, switch_desktop};
 use byte::paths::{HostPaths, TestPaths};
@@ -241,8 +242,11 @@ fn switching_an_account_to_itself_changes_nothing() {
         serde_json::json!("account-a"),
         "self-switch must not clear the OAuth keys"
     );
-    // No journal file should be created.
-    assert!(!dp.desktop_dir().join(".journal").exists());
+    // No journal file should be created. The journal lives under HostPaths
+    // (`<byte_config_dir>/desktop/journal.json`), a different temp root from
+    // the desktop directory entirely -- an assertion aimed at the desktop
+    // root, or at a filename byte never writes, could never have failed.
+    assert!(!tp.desktop_journal_file().exists());
 }
 
 #[test]
@@ -273,4 +277,231 @@ fn a_self_switch_is_a_no_op_even_when_a_profile_is_already_stored() {
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
     assert_eq!(cfg["lastKnownAccountUuid"], serde_json::json!("account-a"));
+}
+
+/// A realistic unrepaired journal: one park that already completed, with the
+/// swap killed before anything was installed. Only its presence matters to
+/// the guard under test, but a hand-authored file that could never have been
+/// written by `swap::execute` would prove less.
+fn seed_interrupted_journal(tp: &TestPaths, live: &std::path::Path, outgoing: &str) {
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(
+        tp.desktop_journal_file(),
+        serde_json::json!({
+            "version": 1,
+            "outgoing": outgoing,
+            "incoming": null,
+            "moves": [{
+                "stage": "Park",
+                "from": live.join("Network"),
+                "to": tp.desktop_profile_dir(outgoing).join("Network"),
+                "done": true
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_unrepaired_journal_refuses_the_switch_without_touching_the_parked_oauth() {
+    // `swap::execute` already refuses to start a swap over an unrepaired
+    // journal -- but by the time it does, the outgoing account's parked
+    // `oauth.json` has already been overwritten, and that file is not
+    // journalled, so no recovery ever repairs it.
+    //
+    // The scenario: `switch a -> b` was interrupted, so the journal survives
+    // and `config.json` still holds a's keys. The next switch names the
+    // now-active account as outgoing -- `switch b -> c`. A capture that runs
+    // before the refusal reads A's keys out of the live `config.json` and
+    // files them as B's parked oauth, destroying b's genuine copy for good.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live(&dp, "account-a");
+    seed_interrupted_journal(&tp, &dp.desktop_dir(), "a");
+
+    // b's genuine parked identity, from the last switch that did complete.
+    let store_b = tp.desktop_profile_dir("b");
+    std::fs::create_dir_all(&store_b).unwrap();
+    let genuine = serde_json::json!({
+        "token_cache": {"accessToken": "b-token"},
+        "token_cache_v2": null,
+        "account_uuid": "account-b"
+    })
+    .to_string();
+    std::fs::write(store_b.join("oauth.json"), &genuine).unwrap();
+
+    let err = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("b"), "c")
+        .expect_err("a swap must not be started over an unrepaired journal");
+
+    assert!(
+        matches!(err, byte::Error::DesktopSwapInterrupted { .. }),
+        "expected the interrupted-swap refusal, got: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store_b.join("oauth.json")).unwrap(),
+        genuine,
+        "a refused switch must be side-effect-free: b's parked oauth must be byte-for-byte \
+         what it was, not the outgoing config.json's stale keys"
+    );
+}
+
+#[test]
+fn the_journal_records_which_two_accounts_the_swap_is_between() {
+    // A completed swap deletes its own journal, so the only seam that can
+    // read these fields back is an `execute` that fails: a colliding park
+    // destination leaves the journal exactly as it was written, before the
+    // first rename.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live(&dp, "account-a");
+
+    // A stored profile for the incoming account, so `incoming` is Some.
+    let stored_b = tp.desktop_profile_dir("b").join("Network");
+    std::fs::create_dir_all(&stored_b).unwrap();
+    std::fs::write(stored_b.join("marker.txt"), "account-b").unwrap();
+
+    // A non-empty directory already sitting where the park must land.
+    let collision = tp.desktop_profile_dir("a").join("Network");
+    std::fs::create_dir_all(&collision).unwrap();
+    std::fs::write(collision.join("marker.txt"), "stale").unwrap();
+
+    let err = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b")
+        .expect_err("the park rename must collide with the occupied destination");
+    assert!(
+        matches!(err, byte::Error::Io { .. }),
+        "expected the rename collision, got: {err}"
+    );
+
+    let journal = Journal::from_bytes(&std::fs::read(tp.desktop_journal_file()).unwrap()).unwrap();
+    assert_eq!(
+        journal.outgoing.as_deref(),
+        Some("a"),
+        "a recovery hitting this journal must be able to name the account being parked"
+    );
+    assert_eq!(
+        journal.incoming.as_deref(),
+        Some("b"),
+        "...and the account being installed"
+    );
+}
+
+#[test]
+fn a_committed_switch_survives_an_accounts_file_it_cannot_read() {
+    // The `desktop_profile` record only feeds `byte list`. By the time it is
+    // written the renames are committed and the journal is cleared, so a `?`
+    // here would report a failed switch over a swap that fully happened --
+    // and, worse, would skip the config patch, leaving `config.json` naming
+    // the OUTGOING account over the incoming account's live directory. No
+    // journal exists by then, so nothing repairs that.
+    //
+    // `AccountsFile::load` fails on ordinary conditions, not just crashes:
+    // malformed JSON reports `Parse`, an outdated file reports
+    // `AccountsSchemaMismatch`.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live(&dp, "account-a");
+    std::fs::write(tp.accounts_file(), b"{ not json at all").unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b")
+        .expect("a display-only bookkeeping failure must not fail an already-committed switch");
+
+    assert_eq!(out, DesktopOutcome::NoProfileForIncoming);
+    // The park committed...
+    assert_eq!(
+        std::fs::read_to_string(tp.desktop_profile_dir("a").join("Network/marker.txt")).unwrap(),
+        "account-a"
+    );
+    // ...and, the half that matters, so did the config patch.
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert!(
+        cfg.get("lastKnownAccountUuid").is_none(),
+        "config.json must not still name the outgoing account over the incoming session"
+    );
+    assert_eq!(cfg["locale"], serde_json::json!("en-GB"));
+}
+
+/// Windows only, and deliberately so: `MoveFileExW` refuses to replace a
+/// read-only destination, which is what makes `atomic::write` -- and with it
+/// `AccountsFile::save` -- fail on a file that still loads perfectly. A POSIX
+/// `rename` over a read-only file succeeds (only the directory's write bit
+/// matters), so there is no equivalent seam there and a portable version of
+/// this test would assert nothing on Unix. The feature under test is itself
+/// Windows-only.
+#[cfg(windows)]
+#[test]
+fn a_committed_switch_survives_an_accounts_file_it_cannot_write() {
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live(&dp, "account-a");
+
+    let mut accounts = byte::store::metadata::AccountsFile::default();
+    accounts.upsert_from("a", &sample_snapshot("a"));
+    accounts
+        .save(&tp.accounts_file(), &tp.backup_dir())
+        .unwrap();
+    set_readonly(&tp.accounts_file(), true);
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b")
+        .expect("an unwritable bookkeeping file must not fail an already-committed switch");
+
+    assert_eq!(out, DesktopOutcome::NoProfileForIncoming);
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert!(
+        cfg.get("lastKnownAccountUuid").is_none(),
+        "config.json must not still name the outgoing account over the incoming session"
+    );
+
+    // Leave nothing read-only behind: TempDir's own cleanup cannot remove a
+    // read-only file on Windows, and `atomic::backup`'s copy carries the
+    // attribute across to the backup it just made.
+    set_readonly(&tp.accounts_file(), false);
+    for entry in std::fs::read_dir(tp.backup_dir()).unwrap().flatten() {
+        set_readonly(&entry.path(), false);
+    }
+}
+
+#[cfg(windows)]
+fn set_readonly(path: &std::path::Path, readonly: bool) {
+    let mut perms = std::fs::metadata(path).unwrap().permissions();
+    perms.set_readonly(readonly);
+    std::fs::set_permissions(path, perms).unwrap();
+}
+
+#[test]
+fn switching_into_an_account_whose_park_stored_nothing_reports_no_stored_profile() {
+    // A park with no movable entries -- a fresh install, or a directory
+    // holding only denylisted content -- still creates the store directory
+    // and writes byte's own `oauth.json` into it. Deciding "is there a stored
+    // profile" on the directory merely existing therefore believes a claim
+    // this module's own write manufactured: it would apply an all-`None`
+    // `DesktopOauth` (which `config::apply` treats as removal, i.e. exactly
+    // what `clear` does) and report `Switched` -- telling the user their
+    // desktop session was restored while signing them out.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let probe = FakeProbe::with_desktop(0, false);
+    // A fresh desktop install: config.json, and nothing that moves.
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({"locale": "en-GB"}).to_string(),
+    )
+    .unwrap();
+
+    let out = switch_desktop(&tp, &dp, &probe, Some("a"), "b").unwrap();
+    assert_eq!(out, DesktopOutcome::NoProfileForIncoming);
+    assert!(
+        tp.desktop_profile_dir("a").join("oauth.json").exists(),
+        "the empty park still creates the store directory -- the state under test"
+    );
+
+    let out = switch_desktop(&tp, &dp, &probe, Some("b"), "a").unwrap();
+
+    assert_eq!(
+        out,
+        DesktopOutcome::NoProfileForIncoming,
+        "an empty park stores no session, so switching back into it restores nothing"
+    );
 }

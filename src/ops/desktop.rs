@@ -9,8 +9,9 @@ use std::path::Path;
 use crate::claude::detect::ProcessProbe;
 use crate::desktop::journal::Journal;
 use crate::desktop::paths::DesktopPaths;
-use crate::desktop::{config, swap};
+use crate::desktop::{config, profile, swap};
 use crate::error::{Error, Result};
+use crate::output;
 use crate::paths::HostPaths;
 use crate::store::metadata::{AccountsFile, DesktopProfileRecord, now_rfc3339};
 
@@ -54,6 +55,39 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
     outgoing: Option<&str>,
     incoming: &str,
 ) -> Result<DesktopOutcome> {
+    // Refuse an unrepaired swap HERE, before anything is written, rather
+    // than leaving it to `swap::execute`'s own identical precondition.
+    // `execute` refuses too late: by the time it runs, the capture block
+    // below has already overwritten the outgoing account's parked
+    // `oauth.json` -- and that file is not in any journal, so no recovery
+    // ever repairs it. Concretely: `switch a -> b` is interrupted, the
+    // journal survives with `config.json` still holding a's keys, and the
+    // next switch names the now-active account as outgoing
+    // (`switch b -> c`). The capture reads a's keys and files them as b's
+    // parked oauth, destroying b's genuine copy; `execute` then refuses,
+    // and a later `switch x -> b` applies a's identity onto b's cookies.
+    // A refusal has to cost nothing, so it comes before every branch.
+    //
+    // Only the check lives here, never the repair: `recover_if_interrupted`
+    // is wired into every command entry point, and running recovery from
+    // two places would be worse than running it from one.
+    let journal_file = paths.desktop_journal_file();
+    let journal_present = journal_file.try_exists().map_err(|source| Error::Io {
+        path: journal_file.clone(),
+        source,
+    })?;
+    if journal_present {
+        return Err(Error::DesktopSwapInterrupted {
+            journal: journal_file,
+            detail: "An earlier swap has not been repaired yet, so byte will not start a new \
+                     one over it -- that would destroy the only record of the old swap while \
+                     its files may already be half-moved. Running any byte command repairs \
+                     it: recovery runs automatically at the start of every command. Do that, \
+                     then retry."
+                .to_string(),
+        });
+    }
+
     // Guard: without this, a self-switch parks the live profile into the
     // very directory it is about to install from, and clears the OAuth keys
     // of the account the user is staying on. A first-time self-switch
@@ -73,7 +107,18 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
     let live = desktop.desktop_dir();
     let park_to = outgoing.map(|uuid| paths.desktop_profile_dir(uuid));
     let install_from = paths.desktop_profile_dir(incoming);
-    let has_incoming = install_from.is_dir();
+    // "Is there a stored profile?" is decided on whether the directory holds
+    // anything that MOVES, not on the directory existing -- because this very
+    // function creates that directory and writes `oauth.json` into it even
+    // when a park had nothing movable to file (a fresh install, or a
+    // directory of purely denylisted content). Believing `is_dir()` there
+    // means believing a claim byte's own write manufactured: the swap would
+    // install nothing, apply an all-`None` `DesktopOauth` (which
+    // `config::apply` treats as removal -- exactly what `clear` does), and
+    // still report `Switched`, telling the user their desktop session was
+    // restored while signing them out. Errors propagate: this runs before
+    // anything has been committed, so refusing is still free here.
+    let has_incoming = !profile::movable_entries(&install_from)?.is_empty();
 
     // The outgoing account's OAuth keys are captured and written into its
     // parked directory BEFORE any rename runs. Order is load-bearing: once
@@ -116,38 +161,82 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
 
     swap::execute(paths, journal)?;
 
-    // The desktop_profile record (task 7) is what lets `byte list` answer
-    // "which accounts have a stored desktop session, and what is it costing
-    // me in disk" -- stamped only once a park actually ran, and only when
-    // accounts.json already knows this account. An unrecognised uuid (no
-    // entry to land the record on) silently skips the stamp rather than
-    // failing a switch whose files have already moved on disk.
-    if let (Some(uuid), Some(park_to)) = (outgoing, park_to.as_deref()) {
-        let mut accounts = AccountsFile::load(&paths.accounts_file())?;
-        if let Ok(meta) = accounts.resolve_mut(uuid) {
-            meta.desktop_profile = Some(DesktopProfileRecord {
-                captured_at: now_rfc3339(),
-                bytes: dir_size(park_to),
-            });
-            accounts.save(&paths.accounts_file(), &paths.backup_dir())?;
-        }
-    }
-
     // The config patch follows the moves, not the other way round: if the
     // moves fail, the app's identity should still name whatever session is
     // actually in place.
     let backups = paths.backup_dir();
-    if has_incoming {
+    let outcome = if has_incoming {
         let stored = install_from.join("oauth.json");
         let oauth = match std::fs::read(&stored) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => config::DesktopOauth::default(),
         };
         config::apply(&desktop.config_file(), &oauth, &backups)?;
-        Ok(DesktopOutcome::Switched)
+        DesktopOutcome::Switched
     } else {
         // Signed out: the user logs in as the new account and byte captures.
         config::clear(&desktop.config_file(), &backups)?;
-        Ok(DesktopOutcome::NoProfileForIncoming)
+        DesktopOutcome::NoProfileForIncoming
+    };
+
+    // Bookkeeping comes LAST, after both halves of the switch have landed,
+    // because it is the only step whose failure must not be allowed to
+    // matter. See `record_parked_profile`.
+    if let (Some(uuid), Some(park_to)) = (outgoing, park_to.as_deref()) {
+        record_parked_profile(paths, uuid, park_to);
+    }
+
+    Ok(outcome)
+}
+
+/// Stamp the `desktop_profile` record for a profile that has just been parked.
+///
+/// This record (task 7) is what lets `byte list` answer "which accounts have
+/// a stored desktop session, and what is it costing me in disk". Nothing else
+/// reads it, and nothing about the switch depends on it.
+///
+/// Infallible by contract, following `atomic::prune`: by the time this runs
+/// the renames are committed, the journal is cleared, and `config.json`
+/// already names the incoming account, so there is nothing left for a caller
+/// to retry or roll back. Both halves fail on entirely ordinary conditions,
+/// not just crashes -- `load` refuses an outdated schema or malformed JSON,
+/// and `save` copies a backup first, which is where this codebase already
+/// sees "Access is denied (os error 5)". Propagating either would turn a
+/// fully committed switch into an `Err` over a display detail, and, worse,
+/// would have to do so from *before* the config patch to be reached at all:
+/// `config.json` would be left holding the outgoing account's
+/// `lastKnownAccountUuid` and `oauth:tokenCache` over the incoming account's
+/// live directory, with no journal left for recovery to find. That silent
+/// mixed-account state is precisely what `desktop::journal` exists to
+/// prevent. Problems are reported through `output::warn` instead.
+fn record_parked_profile(paths: &impl HostPaths, uuid: &str, park_to: &Path) {
+    let file = paths.accounts_file();
+
+    let Ok(mut accounts) = AccountsFile::load(&file) else {
+        output::warn(&format!(
+            "the desktop session was switched, but {} could not be read, so the stored \
+             desktop profile for '{uuid}' will not be listed",
+            file.display()
+        ));
+        return;
+    };
+
+    // An unrecognised uuid has no entry to land the record on. Silent, not
+    // warned: byte can legitimately park a profile for an account whose
+    // metadata it does not track.
+    let Ok(meta) = accounts.resolve_mut(uuid) else {
+        return;
+    };
+    meta.desktop_profile = Some(DesktopProfileRecord {
+        captured_at: now_rfc3339(),
+        bytes: dir_size(park_to),
+    });
+
+    if let Err(e) = accounts.save(&file, &paths.backup_dir()) {
+        output::warn(&format!(
+            "the desktop session was switched, but the stored desktop profile for '{uuid}' \
+             could not be recorded in {}: {e}",
+            file.display()
+        ));
     }
 }
