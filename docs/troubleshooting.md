@@ -9,7 +9,7 @@ what's quoted here.
 |---|---|---|
 | `Claude Code file not found: <path>` | Claude Code isn't installed, or has never logged in, so `.claude.json` or `.credentials.json` doesn't exist yet. Nothing is created or changed. | Install Claude Code and log in at least once, then retry. If you're using `CLAUDE_CONFIG_DIR`, confirm it points at the right directory. |
 | `failed to parse <path>: ...` | The file exists but isn't valid JSON — most likely something else wrote to it mid-edit. byte aborts before writing anything rather than overwriting a file it can't fully understand. | Fix or restore the file by hand (see "Recovering from a backup" below), then retry. |
-| `io error on <path>: ...` | A filesystem operation failed — permission denied, disk full, a read-only volume, or similar — or, when `<path>` names a registry key such as `Software\Microsoft\Windows\CurrentVersion\Run`, the registry operation behind `byte autostart` failed. This is the most likely real-world error and can surface at almost any step: reading a live file, creating byte's config directory, or writing a backup. | Check disk space and permissions on the reported path, then retry; for the registry case, check that your user can write its own `Run` key. |
+| `io error on <path>: ...` | A filesystem operation failed — permission denied, disk full, a read-only volume, or similar — or, when `<path>` names a registry key such as `Software\Microsoft\Windows\CurrentVersion\Run`, the registry operation behind `byte autostart` failed. This is the most likely real-world error and can surface at almost any step: reading a live file, creating byte's config directory (including the desktop profile store, below), or writing a backup. | Check disk space and permissions on the reported path, then retry; for the registry case, check that your user can write its own `Run` key. |
 | `no account matching '<name>'` | `<name>` didn't match any stored account's label, email, or UUID prefix. | Run `byte list` to see exact labels, or `byte capture` / `byte add` first if the account isn't stored yet. |
 | `'<name>' is ambiguous; it matches N accounts` | `<name>` matched more than one account as a prefix. | Use a longer prefix, or the account's exact label or email. |
 | `no Claude account is currently logged in` | `byte capture` (or the first half of `byte add`) ran while Claude Code had no live credentials. | Log in with `claude` first, then retry. |
@@ -36,8 +36,12 @@ A few behaviors worth calling out even though they aren't errors:
 - **Switching to the already-active account** is a no-op — byte still syncs
   the live credentials back to the store first (in case Claude Code rotated
   the token), then reports that the account was already active.
-- **`the desktop session was switched, but ... the stored desktop profile
-  for '<account>' could not be recorded`** is a warning, not a failure. The
+- **`the desktop session was switched, but <accounts.json path> could not be
+  read, so the stored desktop profile for '<account>' will not be listed`**,
+  or **`the desktop session was switched, but the stored desktop profile for
+  '<account>' could not be recorded in <accounts.json path>: ...`** — two
+  wordings of the same warning, not a failure, depending on whether
+  `accounts.json` could be read at all or was read but failed to save. The
   desktop session itself has already been switched — the profile directories
   have moved and the app's `config.json` has been patched — and the only
   thing missing is the bookkeeping line that lets `byte list` show that
@@ -58,19 +62,42 @@ A few behaviors worth calling out even though they aren't errors:
     outgoing side of a switch while signed in to Claude Desktop). Sign in
     once and the next switch away from it captures one.
   - **`Claude's desktop app is signed in as a different account than byte
-    expected, so its desktop session was left alone rather than filed under
-    the wrong account. Sign out in Claude, then run this switch again to
-    move it too.`** — `config.json`'s `lastKnownAccountUuid` names a
-    different account than the one byte was about to park the live session
-    under. The two halves have drifted apart: byte's tray switches Claude
-    Code without touching the desktop app at all, and you can sign into
-    Claude Desktop by hand at any time. Parking anyway would write this
-    account's cookies and OAuth keys into the *other* account's stored
-    profile, so a later switch into that account would restore the wrong
-    session and apply the wrong identity. Nothing on disk was changed — the
-    Claude Code switch itself still happened. A desktop app that is signed
-    out (no `lastKnownAccountUuid` at all) is not a mismatch and is parked
-    normally; there is no session there to misfile.
+    expected there, so its session was left alone rather than filed under
+    the wrong account -- nothing changed. If it's already showing the
+    account you just switched to, there is nothing more to do. Otherwise,
+    sign out of Claude Desktop and sign in again there as the account you
+    want; byte will capture that session the next time you switch away from
+    it.`** — `config.json`'s `lastKnownAccountUuid` names a different
+    account than the one byte was about to park the live session under. The
+    two halves have drifted apart: byte's tray switches Claude Code without
+    touching the desktop app at all, and you can sign into Claude Desktop by
+    hand at any time.
+
+    The most common way to reach this message is exactly that drift: a tray
+    click switches Claude Code to a new account while the desktop app stays
+    signed in as the old one; a later CLI `byte switch` back to that old
+    account then finds the desktop app *already* correct, but byte's own
+    bookkeeping still names the account Claude Code is switching *away from*
+    as the one to file the live session under. That is why the message no
+    longer says unconditionally to sign out — an earlier wording did, and
+    following it in this exact case would destroy a working, correctly
+    signed-in session for no benefit. Re-running the same `byte switch` is
+    not the fix either: by the time this message prints, the Claude Code
+    half has already committed, so a repeat of the identical switch is a
+    self-switch and never re-attempts the desktop half at all — the only way
+    to actually change what the desktop app is signed in as is by hand,
+    directly in Claude.
+
+    In the genuine-drift case (the app is signed in as neither the account
+    you switched from nor the one you switched to), parking anyway would
+    write this account's cookies and OAuth keys into the *other* account's
+    stored profile, so a later switch into that account would restore the
+    wrong session and apply the wrong identity — which is what the refusal
+    itself still guards against regardless of which of the two situations
+    produced it. Nothing on disk was changed — the Claude Code switch itself
+    still happened. A desktop app that is signed out (no
+    `lastKnownAccountUuid` at all) is not a mismatch and is parked normally;
+    there is no session there to misfile.
   - **`the Claude Code switch succeeded, but its desktop app session could
     not be switched: ...`** — the desktop half hit an error (for example, an
     unrepaired journal from an earlier interruption — see
@@ -177,6 +204,42 @@ A few behaviors worth calling out even though they aren't errors:
   either could leave you unsure whether you're logged in as anything. Two
   errors from one `byte add` is the signal to check `byte current` and, if
   it looks wrong, follow "Recovering from a backup" below.
+
+## Desktop app switching is unverified
+
+Every automated test for the Windows desktop-switching feature above runs
+against a synthetic profile tree in a temporary directory (see
+[Architecture](architecture.md)) — none of them launch the real Claude
+desktop app. That leaves the one question that actually matters unanswered:
+whether swapping this particular set of directories and `config.json` keys
+actually changes what a real, running Claude shows as signed in.
+
+It cannot be answered by an automated test, and, worse, it cannot currently
+be checked from inside a session running in the Claude desktop app either:
+the decisive test requires quitting the app entirely, which ends the very
+session that would be doing the checking. It needs a person, a second Claude
+account, and a willingness to be signed out mid-session:
+
+1. `byte capture` the current desktop session by switching away and back
+   once.
+2. Quit Claude entirely. Confirm no `claude.exe` under
+   `AppData\Local\AnthropicClaude` remains.
+3. `byte switch <other account>`.
+4. Open Claude. Confirm it is signed in as the other account — the chat side
+   *and* the Code tab.
+5. Switch back. Confirm the original session returns, including
+   conversation history.
+
+If step 4 shows a signed-out app rather than the other account, the
+OAuth-cache half (`config.json`'s three owned keys) is not sufficient on its
+own to switch the app, and that finding belongs back in the design — not
+papered over here — before anything built on top of it should be trusted.
+
+Until someone has actually run this checklist against a real signed-in
+installation, treat desktop switching as **unproven, not tested**: every
+other claim in this document and elsewhere about the desktop half describes
+what the code is written to do, not what has been confirmed to happen in the
+real app.
 
 ## Recovering from a backup
 

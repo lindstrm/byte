@@ -500,10 +500,26 @@ fn report_desktop_outcome(outcome: &Result<DesktopOutcome>) {
             "No desktop session stored for this account yet, so Claude will open signed out. \
              Sign in there once and byte will remember it.",
         ),
+        // Deliberately conditional, not a blanket "sign out" instruction:
+        // the most common way to reach this is a tray click that switched
+        // Claude Code without touching the desktop app (see the tray's
+        // `Action::SwitchTo`), followed by a CLI `byte switch` back to the
+        // account the desktop app was on the whole time. In that case the
+        // app is ALREADY correct, and the old unconditional wording told
+        // the user to destroy a working session for no benefit. Telling
+        // them to retry the same switch is no better: by the time this
+        // message prints, the Claude Code half has already committed, so a
+        // repeat of the same `byte switch` is a self-switch and never
+        // re-attempts the desktop half at all (see `desktop_half`'s
+        // `already_active` guard) -- so the fix, when one is actually
+        // needed, has to happen by hand, directly in the app.
         Ok(DesktopOutcome::IdentityMismatch) => output::warn(
-            "Claude's desktop app is signed in as a different account than byte expected, so \
-             its desktop session was left alone rather than filed under the wrong account. \
-             Sign out in Claude, then run this switch again to move it too.",
+            "Claude's desktop app is signed in as a different account than byte expected \
+             there, so its session was left alone rather than filed under the wrong account \
+             -- nothing changed. If it's already showing the account you just switched to, \
+             there is nothing more to do. Otherwise, sign out of Claude Desktop and sign in \
+             again there as the account you want; byte will capture that session the next \
+             time you switch away from it.",
         ),
         Ok(DesktopOutcome::NothingToDo) => {}
         Err(e) => output::warn(&desktop_failure_message(e)),

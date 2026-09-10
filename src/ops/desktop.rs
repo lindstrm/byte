@@ -78,6 +78,14 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
     outgoing: Option<&str>,
     incoming: &str,
 ) -> Result<DesktopOutcome> {
+    // Owner-only (where the platform allows it) and created before anything
+    // else in this function writes into it -- see `create_store_dir`'s own
+    // doc comment for exactly what protection this does and does not
+    // provide on Windows (design §6). Idempotent, so paying this cost on
+    // every call, including the early-return branches below, is cheap and
+    // simpler than threading a second call site through them.
+    swap::create_store_dir(paths)?;
+
     // Refuse an unrepaired swap HERE, before anything is written, rather
     // than leaving it to `swap::execute`'s own identical precondition.
     // `execute` refuses too late: by the time it runs, the capture block

@@ -11,6 +11,35 @@ use crate::desktop::journal::{Journal, Stage};
 use crate::error::{Error, Result};
 use crate::paths::HostPaths;
 
+/// Create the profile store with owner-only access.
+///
+/// This is a partial measure on Windows and the plan says so rather than
+/// implying otherwise. A real per-directory ACL needs the `windows` crate,
+/// which this change deliberately does not add; instead the store is created
+/// under byte's config directory, which lives beneath `%APPDATA%` and
+/// inherits that location's user-scoped ACL. That is the same protection
+/// `accounts.json` already relies on -- but `accounts.json` holds metadata,
+/// and this holds cookies, so the weaker guarantee is worth naming.
+pub fn create_store_dir(paths: &impl HostPaths) -> Result<()> {
+    let dir = paths.desktop_store_dir();
+    std::fs::create_dir_all(&dir).map_err(|source| Error::Io {
+        path: dir.clone(),
+        source,
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(&dir, perms).map_err(|source| Error::Io {
+            path: dir.clone(),
+            source,
+        })?;
+    }
+
+    Ok(())
+}
+
 /// What to do with an interrupted swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recovery {

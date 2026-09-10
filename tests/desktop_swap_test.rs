@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use byte::desktop::journal::{Journal, Move, Stage};
-use byte::desktop::swap::{Recovery, execute, recover_if_interrupted, recovery_for};
+use byte::desktop::swap::{
+    Recovery, create_store_dir, execute, recover_if_interrupted, recovery_for,
+};
 use byte::paths::{HostPaths, TestPaths};
 
 fn seed(dir: &Path, names: &[(&str, &str)]) {
@@ -27,6 +29,42 @@ fn move_index(j: &Journal, stage: Stage, name: &str) -> usize {
         .iter()
         .position(|m| m.stage == stage && m.from.file_name().and_then(|n| n.to_str()) == Some(name))
         .unwrap_or_else(|| panic!("no {stage:?} move named {name:?} in the plan"))
+}
+
+#[test]
+fn the_profile_store_is_created_owner_only() {
+    let tp = TestPaths::new().unwrap();
+    create_store_dir(&tp).unwrap();
+    assert!(tp.desktop_store_dir().is_dir());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(tp.desktop_store_dir())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "the store must not be group/world readable"
+        );
+    }
+}
+
+#[test]
+fn creating_the_store_twice_is_harmless() {
+    // `switch_desktop` calls this unconditionally on every invocation, so it
+    // must tolerate a directory that already exists -- including one that
+    // already holds a parked profile -- rather than erroring the second time.
+    let tp = TestPaths::new().unwrap();
+    create_store_dir(&tp).unwrap();
+    let marker = tp.desktop_store_dir().join("uuid-a");
+    std::fs::create_dir_all(&marker).unwrap();
+
+    create_store_dir(&tp).unwrap();
+
+    assert!(marker.is_dir(), "an existing parked profile must survive");
 }
 
 #[test]
