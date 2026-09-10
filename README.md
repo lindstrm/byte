@@ -152,10 +152,10 @@ there once and byte captures that session automatically the next time you
 switch away from it, the same way `byte add` captures a fresh Claude Code
 login.
 
-If Claude is running, the desktop half is skipped and reported rather than
-attempted, rather than risk corrupting a session by moving its files out
-from underneath the running app. Quit Claude and run the same switch again
-to move it.
+If Claude is running, the desktop half is skipped and reported instead of
+attempted, since moving its files out from underneath a running process
+risks corrupting the session. Quit Claude and run the same switch again to
+move it.
 
 **Credentials on disk.** A desktop session's cookies don't fit in the OS
 credential store, so each account's parked session is stored as ordinary

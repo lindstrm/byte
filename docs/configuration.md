@@ -42,7 +42,7 @@ Within that directory:
 
 | Path | Contents |
 |---|---|
-| `accounts.json` | Every stored account's metadata and which one is active: label, email, organization, UUID, billing type, organization role, subscription tier, the associated Claude Code `userID`, and added/last-used timestamps — in effect, the full `oauthAccount` profile Claude Code stores per account, plus display fields byte derives from it. Once an account's Claude desktop session has been parked at least once, its entry also carries a `desktop_profile` record (when it was captured, and its size on disk) — this is metadata about the parked session, not the session itself; the session's files live under `desktop/`, below. Absent until then. No secrets: `accessToken`/`refreshToken` are never written here (see below). Safe to read directly. |
+| `accounts.json` | Every stored account's metadata and which one is active: label, email, organization, UUID, billing type, organization role, subscription tier, the associated Claude Code `userID`, and added/last-used timestamps — in effect, the full `oauthAccount` profile Claude Code stores per account, plus display fields byte derives from it. Once an account's Claude desktop session has been parked at least once, its entry also carries a `desktop_profile` record (when it was captured, and its size on disk); absent until then. That record is metadata about the parked session, not the session itself — the session's own files live under `desktop/`, below. No secrets: `accessToken`/`refreshToken` are never written here (see below). Safe to read directly. |
 | `backups/` | Timestamped copies of `.claude.json`, `.credentials.json`, and `accounts.json`, made before every write. The ten most recent per file are kept. See [Troubleshooting](troubleshooting.md) for how to restore one. |
 | `desktop/` | One subdirectory per account with a parked Claude desktop app session, named by the account's UUID, holding that session's files (cookies, local/session storage, Code-tab history) plus `oauth.json` (the desktop app's own captured OAuth cache for that account). `journal.json` sits directly under `desktop/` and exists only while a swap is in progress — normally absent. **Contains live session credentials as ordinary files, not OS-keychain entries** — see [The desktop profile store](#the-desktop-profile-store) below. Windows only: absent entirely on every other platform unless `CLAUDE_DESKTOP_DIR` is set. |
 | `mutation.lock` | An empty file used only as an advisory OS lock, held for the duration of a single `switch`/`capture`/`add`/`remove`/`rename` — whichever process (CLI or tray) is doing it. Its content, if any, is not meaningful; only holding the lock is. Released automatically when that process exits, even on a crash. |
@@ -121,9 +121,10 @@ local/session storage, Code-tab history, and `oauth.json` (the desktop
 app's own OAuth cache for that account, captured from its `config.json`).
 This is the **one place byte stores a secret outside the OS credential
 store**. See the [README](../README.md#desktop-app-windows) for what moves
-between accounts, what gets patched in place instead, and why moving
-account state this way is still safe even though it takes many separate
-directory renames rather than one atomic write.
+between accounts versus what gets patched in place, and
+[Architecture](architecture.md) for how a swap that takes many separate
+directory renames, rather than one atomic write, still survives being
+interrupted partway through.
 
 Its permissions are more modest than "the one place a secret lives outside
 the keychain" might suggest, and this project would rather say so plainly
