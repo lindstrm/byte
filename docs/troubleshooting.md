@@ -75,6 +75,19 @@ A few behaviors worth calling out even though they aren't errors:
     desktop app at all, and you can sign into Claude Desktop by hand at any
     time.
 
+    **When Claude Code itself was logged out for this switch**, the last
+    sentence reads differently: **`Claude Code was logged out when this
+    switch started, so byte had no account to attribute that session to. Log
+    in to Claude Code first, then switch again -- byte will capture the
+    desktop session once it knows whose it is.`** Signing out of Claude
+    Desktop and back in is a no-op in that case — the refusal is not about
+    what the app is showing, it is that Claude Code itself had nothing to
+    compare it against — so the message names the fix that actually works
+    instead. This is the wording for the "Claude Code logged out, over a
+    live directory that still holds a session" case further down (and its
+    `Unreadable`/unusable-identifier neighbors), not for a live disagreement
+    between two accounts Claude Code already knows about.
+
     The most common way to reach this message is exactly that drift: a tray
     click switches Claude Code to a new account while the desktop app stays
     signed in as the old one; a later CLI `byte switch` back to that old
@@ -137,6 +150,20 @@ A few behaviors worth calling out even though they aren't errors:
       profile store entirely. Nothing on your machine writes such a value;
       byte checks because `config.json` belongs to another application and
       byte does not own what goes into it.
+  - **`The account just switched to has an identifier byte cannot use to
+    locate a stored Claude Desktop profile, so its desktop session was left
+    untouched -- nothing changed there. This usually means Claude Code's own
+    record of the account is malformed; removing and re-adding it with
+    `byte remove` and `byte add` will give it a fresh one.`** — a different
+    account than the one above: this is the account Claude Code just
+    switched *to*, not the live session being parked. Its identifier came
+    from `.claude.json`'s own `accountUuid`, and if that value cannot name a
+    directory (empty, `.`, `..`, or containing `/`, `\`, `:` or a NUL), byte
+    will not join it onto its profile store to look for a stored session --
+    doing so could resolve outside the store entirely. This does not read as
+    "no stored profile" (`No desktop session stored for this account yet...`
+    above); it means the account's own identity data is unusable, which
+    switching again will not fix on its own.
   - **`the desktop session for this account was restored, but its saved
     sign-in at <path> could not be read (...), so Claude Desktop will open
     signed out. Sign in there once and byte will capture it again.`**,
@@ -193,7 +220,8 @@ A few behaviors worth calling out even though they aren't errors:
   **`byte switch --json` switches the desktop half too**, and answers in the
   payload instead of on stderr: a `desktop` field carrying one lowercase
   string — `"switched"`, `"app_running"`, `"no_profile_for_incoming"`,
-  `"identity_mismatch"`, `"switched_without_identity"` or `"nothing_to_do"`
+  `"identity_mismatch"`, `"incoming_identifier_invalid"`,
+  `"switched_without_identity"` or `"nothing_to_do"`
   — one per case above, including the self-switch case that prints nothing
   at all — plus `"failed"` when the
   desktop half errored. The field is `null` when the
@@ -217,8 +245,8 @@ A few behaviors worth calling out even though they aren't errors:
   finished either completing the install (`RollForward`) or undoing the
   parks (`Reverse`). A swap is two things — the profile directories, and the
   account keys inside the desktop app's own `config.json` — and *this*
-  wording means both landed: nothing further is needed. The two variants
-  below are the same repair reporting that one half did not.
+  wording means both landed: nothing further is needed. The variants below
+  are the same repair reporting that the second half did not.
 
   That recovery only runs when
   the command can take byte's mutation lock: a journal is on disk for the
@@ -253,12 +281,26 @@ A few behaviors worth calling out even though they aren't errors:
   been kept so a later byte command can finish it.`** — the profile
   directories were put back where they belong (that needs nothing but the
   journal), but `%APPDATA%\Claude` could not be resolved this run, so
-  `config.json` was not reached. This is the one repair that deliberately
-  does **not** clear the journal: the swap is genuinely unfinished, and only
-  a command that can find the app can complete it. Run byte again on the
-  machine and account where Claude Desktop is installed, or set
-  `CLAUDE_DESKTOP_DIR` (see [Configuration](configuration.md)). Do not
-  delete the journal.
+  `config.json` was not reached. This is one of two repairs that
+  deliberately do **not** clear the journal (the next bullet is the other):
+  the swap is genuinely unfinished, and only a command that can find the app
+  can complete it. Run byte again on the machine and account where Claude
+  Desktop is installed, or set `CLAUDE_DESKTOP_DIR` (see
+  [Configuration](configuration.md)). Do not delete the journal.
+- **`repaired the directory half of an interrupted desktop profile swap
+  (...), but its journal names an account identifier ('<uuid>') byte will
+  not use to look up a stored profile, so which account Claude Desktop is
+  signed in as was left alone. The swap's journal has been kept -- this
+  needs to be inspected by hand rather than repaired automatically.`** — the
+  profile directories were put back where they belong, but the journal's
+  own `incoming` or `outgoing` field cannot name a directory in byte's
+  profile store (the same check described under `IncomingIdentifierInvalid`
+  above), so `config.json` was not reached either. This should not happen
+  for a journal byte wrote itself: `switch_desktop` refuses to write such a
+  value into a journal in the first place. Reaching it means an existing
+  journal predates that check, or was edited by hand — inspect the named
+  identifier and the journal's `from`/`to` paths yourself; this is not
+  something a later byte command will resolve on its own.
 - **`byte could not take its mutation lock to check for an interrupted
   desktop profile swap, so this command is continuing without checking:
   ...`** is the third possibility for that same check: the lock file itself

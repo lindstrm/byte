@@ -1119,3 +1119,58 @@ fn a_park_only_swap_whose_patch_failed_is_finished_not_undone() {
     assert_eq!(cfg["locale"], serde_json::json!("en-GB"));
     assert!(!tp.desktop_journal_file().exists());
 }
+
+#[test]
+fn a_roll_forward_naming_an_unusable_incoming_identifier_keeps_the_journal_for_a_human() {
+    // Defense in depth, not a live exposure: `switch_desktop` refuses to
+    // persist an `incoming` that fails `is_profile_store_component`, so an
+    // on-disk journal should never carry one. `restore_identity` checks
+    // anyway, the same way `park_under` is checked at every arm that could
+    // construct a `ParkTarget::Under` rather than only the one arm a bad
+    // value is known to originate from -- there is no arm here where
+    // letting an unusable identifier reach `desktop_profile_dir` would be
+    // correct either.
+    //
+    // Modelled on `rolling_forward_into_an_account_with_nothing_stored_signs_the_app_out`:
+    // a single already-`done` Install move is enough for `recovery_for` to
+    // pick `RollForward` without any real rename left to perform, isolating
+    // this test to the identity half.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let live = dp.desktop_dir();
+    let before =
+        serde_json::json!({"lastKnownAccountUuid": "uuid-a", "locale": "en-GB"}).to_string();
+    std::fs::write(dp.config_file(), &before).unwrap();
+
+    let j = Journal {
+        version: 1,
+        outgoing: None,
+        incoming: Some("..".to_string()),
+        moves: vec![Move {
+            stage: Stage::Install,
+            from: tp.byte_config_dir().join("nothing"),
+            to: live.join("nothing"),
+            done: true,
+        }],
+    };
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let repair = recover_if_interrupted(&tp, Some(&dp)).unwrap().unwrap();
+
+    assert_eq!(repair.recovery, Recovery::RollForward);
+    assert_eq!(
+        repair.identity,
+        IdentityRepair::AccountIdentifierInvalid("..".to_string())
+    );
+    assert_eq!(
+        std::fs::read_to_string(dp.config_file()).unwrap(),
+        before,
+        "an identifier byte will not use must never reach a lookup that ends up patching \
+         config.json"
+    );
+    assert!(
+        tp.desktop_journal_file().exists(),
+        "nothing here can be assumed safe to discard automatically"
+    );
+}

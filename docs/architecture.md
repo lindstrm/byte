@@ -198,15 +198,26 @@ error, output, paths, atomic
   left holding the previous account's value.
 - **`DesktopOutcome`** (`ops/desktop.rs`) — what `switch_desktop` managed to
   do: `Switched`, `AppRunning`, `NoProfileForIncoming`, `IdentityMismatch`,
-  `SwitchedWithoutIdentity`, or `NothingToDo`. Returned as `Ok`, never as a
+  `IncomingIdentifierInvalid`, `SwitchedWithoutIdentity`, or `NothingToDo`.
+  Returned as `Ok`, never as a
   failure that would propagate past the Claude Code switch that already
   committed by the time `switch_desktop` runs — see the `ops::desktop`
-  bullet above.
+  bullet above. `IncomingIdentifierInvalid` is distinct from
+  `IdentityMismatch`: it fires when the account just switched to (not the
+  live session) carries an identifier that fails
+  `paths::is_profile_store_component`, which `install_from` is checked
+  against before it is ever joined onto the profile store — see that
+  function's doc comment for why treating the failure as "no stored
+  profile" would be wrong.
 - **`Repair`** (`desktop/swap.rs`) — what `recover_if_interrupted` managed
   to finish: a `Recovery` (`RollForward`/`Reverse`) for the renames, and an
   `IdentityRepair` for the `config.json` patch. The two fail independently,
-  and `Deferred` — no desktop paths available this run — is the one answer
-  that keeps the journal on disk.
+  and `Deferred` — no desktop paths available this run — is one answer that
+  keeps the journal on disk; `AccountIdentifierInvalid(uuid)` is the other,
+  for a journal whose `incoming`/`outgoing` names an identifier
+  `restore_identity` will not use to locate a stored profile (the same
+  check as `IncomingIdentifierInvalid` above, applied where recovery reads
+  the journal back).
 
 ## Command flow, end to end
 

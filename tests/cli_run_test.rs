@@ -17,8 +17,9 @@ use byte::claude::detect::FakeProbe;
 use byte::claude::files::ClaudeFiles;
 use byte::claude::snapshot::SCHEMA_VERSION;
 use byte::cli::run::{
-    cmd_add, cmd_switch, desktop_paths_if_installed, format_size, recover_under_lock,
-    remove_prompt, repair_message, resolve_add_failure, running_sessions_warning, switch_json,
+    cmd_add, cmd_switch, desktop_paths_if_installed, format_size, identity_mismatch_message,
+    recover_under_lock, remove_prompt, repair_message, resolve_add_failure,
+    running_sessions_warning, switch_json,
 };
 use byte::desktop::paths::{DesktopPaths, TestDesktopPaths};
 use byte::desktop::swap::{IdentityRepair, Recovery, Repair};
@@ -700,6 +701,55 @@ fn switch_json_names_every_desktop_outcome_in_lower_snake_case() {
         json!("switched_without_identity")
     );
     assert_eq!(field(DesktopOutcome::NothingToDo), json!("nothing_to_do"));
+    // Distinct from `identity_mismatch`: this is byte refusing to use the
+    // INCOMING account's own identifier, not a live-session disagreement
+    // about the outgoing side, and a script needs to be able to tell them
+    // apart too.
+    assert_eq!(
+        field(DesktopOutcome::IncomingIdentifierInvalid),
+        json!("incoming_identifier_invalid")
+    );
+}
+
+// `identity_mismatch_message` is reached for two families of reason (see its
+// own doc comment): the desktop app disagrees with an account Claude Code
+// already knows about, or Claude Code itself had none to compare against.
+// Only the second is fixed by logging in to Claude Code -- the first is
+// fixed by fixing the desktop app's own sign-in -- so the two must not say
+// the same thing.
+
+#[test]
+fn identity_mismatch_message_names_the_desktop_app_fix_when_claude_code_had_an_account() {
+    let msg = identity_mismatch_message(false);
+
+    assert!(
+        msg.contains("sign out of Claude Desktop and sign in again"),
+        "Claude Code already had an account to compare against, so the fix is in the app: {msg}"
+    );
+    assert!(
+        !msg.contains("Log in to Claude Code"),
+        "that advice is a no-op here -- Claude Code was never the problem: {msg}"
+    );
+}
+
+#[test]
+fn identity_mismatch_message_names_logging_into_claude_code_when_it_had_no_account() {
+    // The refusal case this message previously left unaddressed: Claude
+    // Code logged out, the desktop app reporting no identity byte can use,
+    // over a live directory that still holds a session. Signing out of an
+    // app that already reports no identity is a no-op; what actually
+    // restores the capability is logging in to Claude Code, so byte has an
+    // account to attribute the live session to on the next switch.
+    let msg = identity_mismatch_message(true);
+
+    assert!(
+        msg.contains("Log in to Claude Code"),
+        "the route that actually restores the capability must be named on screen: {msg}"
+    );
+    assert!(
+        !msg.contains("sign out of Claude Desktop and sign in again"),
+        "that advice is a no-op when the app already reports no identity: {msg}"
+    );
 }
 
 // A repair now has two halves -- the renames and the patch of the desktop
@@ -742,6 +792,23 @@ fn a_repair_that_could_not_reach_the_config_says_what_is_outstanding() {
     assert!(
         msg.contains("journal has been kept"),
         "and must be told why a journal is still on disk: {msg}"
+    );
+}
+
+#[test]
+fn a_repair_naming_an_unusable_account_identifier_keeps_the_journal_and_says_so() {
+    let msg = repair_message(&Repair {
+        recovery: Recovery::RollForward,
+        identity: IdentityRepair::AccountIdentifierInvalid("..".to_string()),
+    });
+
+    assert!(
+        msg.contains("journal has been kept"),
+        "this is not a finished repair -- the journal must not read as resolved: {msg}"
+    );
+    assert!(
+        msg.contains(".."),
+        "the unusable identifier itself belongs in the message: {msg}"
     );
 }
 

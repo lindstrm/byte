@@ -333,6 +333,17 @@ pub enum IdentityRepair {
     /// work reports `NotNeeded` instead, whether or not paths were
     /// available; see `restore_identity`.
     Deferred,
+    /// The journal names an account (`incoming` on a roll-forward,
+    /// `outgoing` on a reversal) that cannot safely name a directory inside
+    /// byte's profile store -- see
+    /// [`crate::paths::is_profile_store_component`]. `config.json` was
+    /// never reached, exactly as for `Deferred` and for the same reason the
+    /// journal is kept: `switch_desktop` refuses to write such a value into
+    /// a journal in the first place (see `ops::desktop`'s own check on
+    /// `incoming`), so reaching this means an existing journal predates that
+    /// check, or was edited by hand. There is nothing here a later command
+    /// can safely infer either, so this is not repaired automatically.
+    AccountIdentifierInvalid(String),
 }
 
 /// Finish the identity half of a repair: make `config.json` describe
@@ -395,6 +406,22 @@ fn restore_identity<P: HostPaths, D: DesktopPaths>(
         config::apply_if_changed(&config_file, &signed_out, &backups)?;
         return Ok(IdentityRepair::Restored);
     };
+
+    // Defense in depth, mirroring `ops::desktop::switch_desktop`'s own check
+    // on `incoming`: `account` reached this function straight from the
+    // journal on disk (`journal.incoming` or `journal.outgoing`), and a
+    // journal is data byte wrote in the past, not data this call has any way
+    // to have validated itself. `switch_desktop` refuses to persist a value
+    // that fails this check, so an on-disk journal should never carry one --
+    // but "should never" is exactly the class of assumption every other
+    // arm in this store, park_under included, treats as worth checking
+    // anyway, because there is no arm where letting an unusable identifier
+    // reach `desktop_profile_dir` would be correct.
+    if !crate::paths::is_profile_store_component(account) {
+        return Ok(IdentityRepair::AccountIdentifierInvalid(
+            account.to_string(),
+        ));
+    }
 
     let stored = paths.desktop_profile_dir(account).join("oauth.json");
     match config::read_stored(&stored) {
@@ -492,10 +519,17 @@ pub fn recover_if_interrupted<P: HostPaths, D: DesktopPaths>(
     let identity = restore_identity(paths, desktop, &journal, recovery)?;
 
     // The journal is the record of BOTH halves, so it is cleared only when
-    // both are as finished as they are going to get. `Deferred` is the one
-    // answer that is not finished: this process could not locate the app, so
-    // the record has to survive for one that can.
-    if identity != IdentityRepair::Deferred {
+    // both are as finished as they are going to get. `Deferred` is not
+    // finished: this process could not locate the app, so the record has to
+    // survive for one that can. `AccountIdentifierInvalid` is not finished
+    // either, for a different reason -- the app WAS locatable, but the
+    // journal names an account this process will not use to look up a
+    // stored profile, so nothing here can be assumed safe to discard
+    // automatically; it needs a human, not a later byte command.
+    if !matches!(
+        identity,
+        IdentityRepair::Deferred | IdentityRepair::AccountIdentifierInvalid(_)
+    ) {
         clear_journal(paths)?;
     }
     Ok(Some(Repair { recovery, identity }))

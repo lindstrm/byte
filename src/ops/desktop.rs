@@ -35,6 +35,12 @@ pub enum DesktopOutcome {
     SwitchedWithoutIdentity,
     /// No outgoing account and nothing stored: there was nothing to move.
     NothingToDo,
+    /// `incoming` cannot safely name a directory inside byte's profile store
+    /// (see [`crate::paths::is_profile_store_component`]), so nothing was
+    /// installed and nothing else was touched either. See `switch_desktop`
+    /// for where this is checked and why it must not be read as "no stored
+    /// profile".
+    IncomingIdentifierInvalid,
 }
 
 /// Which account's store the live profile should be filed under.
@@ -287,6 +293,34 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
     // guard at the top of this function exists to prevent.
     if park_under.as_deref() == Some(incoming) {
         return Ok(DesktopOutcome::NothingToDo);
+    }
+
+    // `incoming` gets the same check `park_under` already gives the outgoing
+    // side, and for the identical reason: it is `switch_desktop`'s own
+    // parameter, but it did not originate with byte. It is
+    // `AccountSnapshot::identity()` -- `.claude.json`'s own `accountUuid`,
+    // read by `store::metadata::AccountsFile::upsert_from` into
+    // `accounts.json` without any check on its shape, only on its presence
+    // -- so a malformed value there reaches here unchanged.
+    //
+    // Unlike the outgoing side, an unchecked value here does not merely
+    // escape the store: `desktop_store_dir().join("..")` resolves to byte's
+    // OWN config directory, whose entries (`accounts.json`, `backups`, the
+    // store itself) are all real, all absent from `profile`'s denylist, and
+    // so all `Move`. `movable_entries` below would find them, `has_incoming`
+    // would be `true` for a reason that has nothing to do with any account's
+    // stored profile, and the plan a few lines down would journal moving
+    // byte's own account database into `%APPDATA%\Claude`.
+    //
+    // Refusing is the only correct response, not treating this as "no
+    // stored profile" (`has_incoming = false`): every name that fails this
+    // check is one `Path::join` cannot treat as an ordinary component at
+    // all, so silently downgrading the refusal to a quieter outcome would
+    // hide a `.claude.json` data problem behind a message that looks
+    // identical to the ordinary "nothing captured yet" case, on every
+    // subsequent switch, with no signal that anything needs fixing.
+    if !crate::paths::is_profile_store_component(incoming) {
+        return Ok(DesktopOutcome::IncomingIdentifierInvalid);
     }
 
     let park_to = park_under

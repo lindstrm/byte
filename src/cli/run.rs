@@ -249,6 +249,13 @@ pub fn repair_message(repair: &Repair) -> String {
              which account it is signed in as was left alone. The swap's journal has been kept \
              so a later byte command can finish it."
         ),
+        IdentityRepair::AccountIdentifierInvalid(uuid) => format!(
+            "repaired the directory half of an interrupted desktop profile swap \
+             ({recovery:?}), but its journal names an account identifier ('{uuid}') byte will \
+             not use to look up a stored profile, so which account Claude Desktop is signed in \
+             as was left alone. The swap's journal has been kept -- this needs to be inspected \
+             by hand rather than repaired automatically."
+        ),
     }
 }
 
@@ -418,6 +425,7 @@ fn desktop_json(outcome: Option<&Result<DesktopOutcome>>) -> serde_json::Value {
         Some(Ok(DesktopOutcome::AppRunning)) => "app_running",
         Some(Ok(DesktopOutcome::NoProfileForIncoming)) => "no_profile_for_incoming",
         Some(Ok(DesktopOutcome::IdentityMismatch)) => "identity_mismatch",
+        Some(Ok(DesktopOutcome::IncomingIdentifierInvalid)) => "incoming_identifier_invalid",
         Some(Ok(DesktopOutcome::SwitchedWithoutIdentity)) => "switched_without_identity",
         Some(Ok(DesktopOutcome::NothingToDo)) => "nothing_to_do",
         Some(Err(_)) => "failed",
@@ -514,7 +522,8 @@ pub fn cmd_switch<P: HostPaths + Copy, S: SecretStore, D: DesktopPaths>(
         // at a silent terminal until it finished before learning that the
         // Claude Code switch they asked for had already succeeded.
         if let Some(result) = desktop_half(sw, probe, desktop, &outcome) {
-            report_desktop_outcome(&result);
+            let claude_code_was_logged_out = matches!(outcome.sync, SyncOutcome::LoggedOut);
+            report_desktop_outcome(&result, claude_code_was_logged_out);
         }
     }
     Ok(())
@@ -566,13 +575,54 @@ fn desktop_failure_message(e: &Error) -> String {
     )
 }
 
+/// The advice shown for `DesktopOutcome::IdentityMismatch`, which is reached
+/// for several different underlying reasons (see `park_target`'s doc comment
+/// and `docs/troubleshooting.md`) that fall into two families: the desktop
+/// app disagrees with an account Claude Code already knows about, or Claude
+/// Code itself had no account to compare against when this switch started
+/// (`outgoing: None` in `ops::desktop::switch_desktop`'s terms).
+///
+/// `claude_code_was_logged_out` distinguishes them because the commonest way
+/// into the second family -- a signed-out desktop app, over a live
+/// directory that still holds a session, while Claude Code is *also* logged
+/// out -- makes the general wording's first instruction, "sign out of
+/// Claude Desktop", nonsensical: there is no session in the app to sign out
+/// of. Logging in to Claude Code first is the more direct fix for that
+/// family: it gives byte an account to attribute the *live* session to
+/// without the user having to separately decide, and act on, which account
+/// to sign into inside Claude Desktop itself. That route, before this, was
+/// stated only in `docs/troubleshooting.md` and never shown here.
+///
+/// `pub`, like `repair_message` and `remove_prompt`, specifically so both
+/// wordings are directly testable without a keychain or a real desktop app.
+pub fn identity_mismatch_message(claude_code_was_logged_out: bool) -> String {
+    let fix = if claude_code_was_logged_out {
+        "Claude Code was logged out when this switch started, so byte had no account to \
+         attribute that session to. Log in to Claude Code first, then switch again -- byte \
+         will capture the desktop session once it knows whose it is."
+    } else {
+        "Otherwise, sign out of Claude Desktop and sign in again there as the account you \
+         want; byte will capture that session the next time you switch away from it."
+    };
+    format!(
+        "Claude's desktop app is not signed in as the account byte expected there, so its \
+         session was left alone rather than filed under the wrong account -- nothing \
+         changed. If it's already showing the account you just switched to, there is \
+         nothing more to do. {fix}"
+    )
+}
+
 /// Report the desktop half's outcome without ever turning it into a command
 /// failure. By the time this runs the Claude Code switch has already
 /// committed, and undoing that is explicitly out of scope (see
 /// `ops::desktop`'s module doc comment) -- this follows the same "never
 /// fail an operation that already succeeded" rule `notify::send` and
 /// `atomic::prune` already apply elsewhere in this codebase.
-fn report_desktop_outcome(outcome: &Result<DesktopOutcome>) {
+///
+/// `claude_code_was_logged_out` is threaded through only for
+/// `identity_mismatch_message` -- see its own doc comment for why that one
+/// case branches on it.
+fn report_desktop_outcome(outcome: &Result<DesktopOutcome>, claude_code_was_logged_out: bool) {
     match outcome {
         Ok(DesktopOutcome::Switched) => output::status("Claude desktop app switched too."),
         Ok(DesktopOutcome::AppRunning) => output::warn(
@@ -596,13 +646,22 @@ fn report_desktop_outcome(outcome: &Result<DesktopOutcome>) {
         // re-attempts the desktop half at all (see `desktop_half`'s
         // `already_active` guard) -- so the fix, when one is actually
         // needed, has to happen by hand, directly in the app.
-        Ok(DesktopOutcome::IdentityMismatch) => output::warn(
-            "Claude's desktop app is not signed in as the account byte expected there, so its \
-             session was left alone rather than filed under the wrong account -- nothing \
-             changed. If it's already showing the account you just switched to, there is \
-             nothing more to do. Otherwise, sign out of Claude Desktop and sign in again \
-             there as the account you want; byte will capture that session the next time you \
-             switch away from it.",
+        Ok(DesktopOutcome::IdentityMismatch) => {
+            output::warn(&identity_mismatch_message(claude_code_was_logged_out));
+        }
+        // `incoming` (the account Claude Code just switched TO) has an
+        // identifier byte cannot use to locate a stored profile at all --
+        // see `ops::desktop::switch_desktop`'s own check. This is not the
+        // ordinary "nothing captured yet" state `NoProfileForIncoming`
+        // reports: it means the account's own identity data is malformed,
+        // which no amount of switching or signing in again will fix on its
+        // own.
+        Ok(DesktopOutcome::IncomingIdentifierInvalid) => output::warn(
+            "The account just switched to has an identifier byte cannot use to locate a \
+             stored Claude Desktop profile, so its desktop session was left untouched -- \
+             nothing changed there. This usually means Claude Code's own record of the \
+             account is malformed; removing and re-adding it with `byte remove` and `byte \
+             add` will give it a fresh one.",
         ),
         // The profile moved, but the account's saved sign-in could not be
         // read, so the app will open signed out. `switch_desktop` has

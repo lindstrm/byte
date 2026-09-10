@@ -1188,3 +1188,48 @@ fn a_traversing_account_uuid_from_the_apps_config_never_redirects_the_park() {
     );
     assert!(!tp.desktop_journal_file().exists());
 }
+
+#[test]
+fn an_incoming_identifier_that_cannot_be_a_directory_name_never_moves_bytes_own_config() {
+    // `incoming` is `switch_desktop`'s own parameter, but it is no more
+    // byte's own value than the outgoing side the previous test guards:
+    // it began life as another application's `.claude.json`
+    // `accountUuid` (`AccountSnapshot::identity`), carried unvalidated
+    // through `store::metadata::AccountsFile::upsert_from` into
+    // `accounts.json`, and back out here as `SwitchOutcome::switched_to.uuid`.
+    // Unlike the outgoing side, an unvalidated value here does not merely
+    // escape the store into an empty corner of the filesystem:
+    // `desktop_profile_dir("..")` resolves to byte's OWN config directory,
+    // whose entries (`accounts.json`, `backups`, the profile store itself)
+    // are all real and none of them denylisted, so an unguarded
+    // `install_from` finds plenty to move -- and the plan a few lines later
+    // would journal installing byte's own account database into
+    // `%APPDATA%\Claude`.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    std::fs::write(
+        tp.accounts_file(),
+        r#"{"schema":2,"active":null,"accounts":[]}"#,
+    )
+    .unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), None, "..").unwrap();
+
+    assert_eq!(out, DesktopOutcome::IncomingIdentifierInvalid);
+    assert!(
+        tp.accounts_file().exists(),
+        "byte's own account database must never be planned as an install move"
+    );
+    assert!(
+        !dp.desktop_dir().join("accounts.json").exists(),
+        "and must never actually land inside the live Claude Desktop directory"
+    );
+    assert!(
+        !dp.desktop_dir().join("backups").exists(),
+        "the profile store's backups must not leak into the live directory either"
+    );
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "a refusal costs nothing: no journal is written for a plan that never ran"
+    );
+}
