@@ -341,3 +341,241 @@ fn execute_refuses_to_start_when_an_earlier_journal_is_still_on_disk() {
         "the pre-existing journal must be left untouched, not overwritten by the new plan"
     );
 }
+
+#[test]
+fn reverse_with_installs_pending_and_no_rename_yet_leaves_both_profiles_where_they_were() {
+    // The shape a real `byte switch` always produces -- parks AND installs
+    // in one plan -- caught in the widest crash window of all: the journal
+    // is on disk and not one rename has run yet.
+    //
+    // Reverse visits installs first (they are planned last), and every
+    // backward install here finds BOTH ends occupied: its source is the live
+    // directory, not parked yet, and its destination is the incoming
+    // profile's directory, not installed yet. Renaming into an occupied
+    // destination is an OS error, and an error escaping the reversal loop
+    // leaves the journal on disk -- which makes every subsequent byte
+    // command reproduce it, forever.
+    let tp = TestPaths::new().unwrap();
+    let live = tp.root().join("Claude");
+    let park = tp.desktop_profile_dir("uuid-a");
+    let take = tp.desktop_profile_dir("uuid-b");
+    seed(
+        &live,
+        &[("Network", "account-a"), ("IndexedDB", "account-a")],
+    );
+    seed(
+        &take,
+        &[("Network", "account-b"), ("IndexedDB", "account-b")],
+    );
+
+    let j = Journal::plan(&live, Some(&park), Some(&take)).unwrap();
+    assert!(
+        j.moves.iter().any(|m| m.stage == Stage::Install),
+        "this test is only meaningful if the plan really contains installs"
+    );
+    assert!(
+        j.moves.iter().all(|m| !m.done),
+        "the window under test is the one before any rename has run"
+    );
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let outcome = recover_if_interrupted(&tp).unwrap();
+
+    assert_eq!(outcome, Some(Recovery::Reverse));
+    assert_eq!(marker(&live.join("Network")).as_deref(), Some("account-a"));
+    assert_eq!(
+        marker(&live.join("IndexedDB")).as_deref(),
+        Some("account-a"),
+        "an untouched live directory must still be live after the reversal"
+    );
+    assert_eq!(
+        marker(&take.join("Network")).as_deref(),
+        Some("account-b"),
+        "the incoming profile was never installed, so it stays in its store"
+    );
+    assert_eq!(
+        marker(&take.join("IndexedDB")).as_deref(),
+        Some("account-b"),
+        "the incoming profile was never installed, so it stays in its store"
+    );
+    assert!(
+        !park.join("Network").exists(),
+        "no park ran, so nothing may be left behind in the outgoing store"
+    );
+    assert!(
+        !park.join("IndexedDB").exists(),
+        "no park ran, so nothing may be left behind in the outgoing store"
+    );
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "recovery must clear the journal or the next command repeats it"
+    );
+}
+
+#[test]
+fn reverse_mid_park_with_installs_pending_restores_every_live_directory() {
+    // The same parks-and-installs shape, interrupted one step later: a
+    // single park has completed and been recorded, the rest of the park has
+    // not, and no install has run. The still-unparked live directory and the
+    // incoming profile's matching directory are both present, which is the
+    // collision Reverse has to absorb rather than fail on.
+    let tp = TestPaths::new().unwrap();
+    let live = tp.root().join("Claude");
+    let park = tp.desktop_profile_dir("uuid-a");
+    let take = tp.desktop_profile_dir("uuid-b");
+    seed(
+        &live,
+        &[("Network", "account-a"), ("IndexedDB", "account-a")],
+    );
+    seed(
+        &take,
+        &[("Network", "account-b"), ("IndexedDB", "account-b")],
+    );
+
+    let mut j = Journal::plan(&live, Some(&park), Some(&take)).unwrap();
+
+    // "Network" is parked for real and recorded; the swap is killed there.
+    let parked = move_index(&j, Stage::Park, "Network");
+    std::fs::create_dir_all(&park).unwrap();
+    std::fs::rename(&j.moves[parked].from, &j.moves[parked].to).unwrap();
+    j.mark_done(parked);
+
+    assert!(
+        !j.moves[move_index(&j, Stage::Park, "IndexedDB")].done,
+        "the second park must still be outstanding for this to be mid-park"
+    );
+    assert!(
+        j.moves.iter().all(|m| m.stage != Stage::Install || !m.done),
+        "no install may have run, or recovery would roll forward instead"
+    );
+
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let outcome = recover_if_interrupted(&tp).unwrap();
+
+    assert_eq!(outcome, Some(Recovery::Reverse));
+    assert_eq!(
+        marker(&live.join("Network")).as_deref(),
+        Some("account-a"),
+        "the parked directory must come back to the live location"
+    );
+    assert_eq!(
+        marker(&live.join("IndexedDB")).as_deref(),
+        Some("account-a"),
+        "the directory that was never parked must still be live"
+    );
+    assert_eq!(
+        marker(&take.join("Network")).as_deref(),
+        Some("account-b"),
+        "the incoming profile was never installed, so it stays in its store"
+    );
+    assert_eq!(
+        marker(&take.join("IndexedDB")).as_deref(),
+        Some("account-b"),
+        "the incoming profile was never installed, so it stays in its store"
+    );
+    assert!(
+        !park.join("Network").exists(),
+        "the reversed park must not leave a copy in the outgoing store"
+    );
+    assert!(!tp.desktop_journal_file().exists());
+}
+
+#[test]
+fn a_reversed_swap_with_installs_pending_is_not_recovered_a_second_time() {
+    // The wedge test. If Reverse fails on the parks-and-installs shape, the
+    // journal survives and every later byte command -- recovery runs at the
+    // start of all of them -- hits the identical error, while `execute`
+    // simultaneously refuses to start a new swap for as long as that journal
+    // exists. A second call returning `Ok(None)` is what proves both exits
+    // are open again.
+    let tp = TestPaths::new().unwrap();
+    let live = tp.root().join("Claude");
+    let park = tp.desktop_profile_dir("uuid-a");
+    let take = tp.desktop_profile_dir("uuid-b");
+    seed(&live, &[("Network", "account-a")]);
+    seed(&take, &[("Network", "account-b")]);
+
+    let j = Journal::plan(&live, Some(&park), Some(&take)).unwrap();
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    assert_eq!(
+        recover_if_interrupted(&tp).unwrap(),
+        Some(Recovery::Reverse)
+    );
+    assert_eq!(
+        recover_if_interrupted(&tp).unwrap(),
+        None,
+        "the repair must be finished after one pass, not repeated forever"
+    );
+    assert_eq!(marker(&live.join("Network")).as_deref(), Some("account-a"));
+}
+
+#[test]
+fn reverse_undoes_an_install_whose_rename_landed_but_was_never_recorded() {
+    // The other half of the same classification, and the reason Reverse may
+    // never skip a move merely because `done` is false. Here the park is
+    // complete and one install's rename has already landed -- but the write
+    // recording it did not, so `recovery_for` still sees no completed
+    // install and reverses. That install's two ends are the mirror image of
+    // the never-ran case: its source (the live directory) is occupied and
+    // its destination (the incoming profile's store) is empty. It must be
+    // renamed back, or the incoming account's directory stays stranded in
+    // the outgoing account's live location.
+    let tp = TestPaths::new().unwrap();
+    let live = tp.root().join("Claude");
+    let park = tp.desktop_profile_dir("uuid-a");
+    let take = tp.desktop_profile_dir("uuid-b");
+    seed(
+        &live,
+        &[("Network", "account-a"), ("IndexedDB", "account-a")],
+    );
+    seed(&take, &[("Network", "account-b")]);
+
+    let mut j = Journal::plan(&live, Some(&park), Some(&take)).unwrap();
+
+    // The park completes fully and is recorded.
+    std::fs::create_dir_all(&park).unwrap();
+    for name in ["Network", "IndexedDB"] {
+        let index = move_index(&j, Stage::Park, name);
+        std::fs::rename(&j.moves[index].from, &j.moves[index].to).unwrap();
+        j.mark_done(index);
+    }
+
+    // The install's rename lands, and the process dies before `mark_done`.
+    let windowed = move_index(&j, Stage::Install, "Network");
+    std::fs::rename(&j.moves[windowed].from, &j.moves[windowed].to).unwrap();
+    assert!(
+        !j.moves[windowed].done,
+        "the window under test is the one where `done` never persisted"
+    );
+
+    std::fs::write(tp.desktop_journal_file(), j.to_bytes().unwrap()).unwrap();
+
+    let outcome = recover_if_interrupted(&tp).unwrap();
+
+    assert_eq!(outcome, Some(Recovery::Reverse));
+    assert_eq!(
+        marker(&take.join("Network")).as_deref(),
+        Some("account-b"),
+        "the install that landed unrecorded must be undone, not left stranded live"
+    );
+    assert_eq!(
+        marker(&live.join("Network")).as_deref(),
+        Some("account-a"),
+        "the outgoing session must be back in the live location"
+    );
+    assert_eq!(
+        marker(&live.join("IndexedDB")).as_deref(),
+        Some("account-a"),
+        "the outgoing session must be back in the live location"
+    );
+    assert!(
+        !park.join("Network").exists(),
+        "a fully reversed park leaves nothing behind in the outgoing store"
+    );
+    assert!(!tp.desktop_journal_file().exists());
+}

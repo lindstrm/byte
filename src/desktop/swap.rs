@@ -98,6 +98,20 @@ enum Direction {
     Backward,
 }
 
+/// Does this path exist, or why could that not be determined?
+///
+/// `Path::exists` collapses every IO error into `false`, so a permission
+/// error on byte's config directory would read as "absent" -- and each
+/// caller below chooses a branch on that answer, one of which is "the
+/// journal is not there, nothing to recover". `try_exists` keeps a real IO
+/// failure a failure, so the guard says what it means.
+fn exists(path: &Path) -> Result<bool> {
+    path.try_exists().map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 /// Apply one move in the given direction, then flip `done` and persist.
 ///
 /// `execute`, RollForward, and Reverse recovery all follow the same shape:
@@ -108,16 +122,30 @@ enum Direction {
 /// source already gone.
 ///
 /// So the physical source/destination pair for this move and direction is
-/// classified before renaming:
-/// - the source still holds the directory -> rename normally.
-/// - the source is empty and the destination already holds the directory ->
-///   an earlier crash landed in this exact window; the rename already
-///   happened and only the journal write recording it did not. Treat it as
-///   a no-op success rather than failing on a source that predictably no
-///   longer exists.
-/// - neither holds it -> genuinely wrong; fall through to the normal
-///   rename, which fails with the OS's own error naming the missing
-///   source. That failure is not papered over.
+/// classified before renaming. Which states are reachable depends on the
+/// direction, and so does what each one means:
+///
+/// - source occupied, destination empty -> the ordinary case; rename.
+/// - source empty, destination occupied -> an earlier crash landed in this
+///   exact window: the rename already happened and only the journal write
+///   recording it did not. Treat it as a no-op success rather than failing
+///   on a source that predictably no longer exists.
+/// - both occupied, undoing (`Backward`) -> this move never ran. Nothing a
+///   swap does can leave a destination occupied once the move's own rename
+///   has landed, so both-occupied is unambiguous: leave the disk alone and
+///   leave `done` as it is. Far from exotic, this is the resting state of
+///   every install move throughout the whole park stage -- the incoming
+///   profile is still in its store and the live directory it would replace
+///   has not been parked yet -- and Reverse walks the installs first.
+///   Renaming here would collide with the occupied destination, and the
+///   resulting error escaping recovery would strand the journal on disk for
+///   every later byte command to trip over.
+/// - both occupied, applying (`Forward`) -> genuinely wrong: something
+///   stale is sitting where this move must land. Falls through to the
+///   rename, which fails with the OS's own error. Not papered over.
+/// - neither occupied -> genuinely wrong in either direction; falls through
+///   to the rename, which fails with the OS's own error naming the missing
+///   source. Not papered over either.
 fn apply_move(
     paths: &impl HostPaths,
     journal: &mut Journal,
@@ -132,7 +160,16 @@ fn apply_move(
         }
     };
 
-    let already_applied = !source.exists() && dest.exists();
+    let source_here = exists(&source)?;
+    let dest_here = exists(&dest)?;
+
+    // A move that never ran has nothing to undo, and its `done` already
+    // says so. Touch neither the filesystem nor the journal.
+    if direction == Direction::Backward && source_here && dest_here {
+        return Ok(());
+    }
+
+    let already_applied = !source_here && dest_here;
     if !already_applied {
         rename(&source, &dest)?;
     }
@@ -156,7 +193,7 @@ fn apply_move(
 /// trusting every future caller to have run recovery first.
 pub fn execute(paths: &impl HostPaths, mut journal: Journal) -> Result<()> {
     let file = paths.desktop_journal_file();
-    if file.exists() {
+    if exists(&file)? {
         return Err(Error::DesktopSwapInterrupted {
             journal: file,
             detail: "An earlier swap left this journal behind and it was never repaired. \
@@ -233,13 +270,18 @@ pub fn recover_if_interrupted(paths: &impl HostPaths) -> Result<Option<Recovery>
         }
         Recovery::Reverse => {
             // Reverse order, so a directory is never restored on top of one
-            // still waiting to be moved out of the way. Every index is
-            // visited, not just those marked `done`: a move whose rename
-            // already happened before a crash but whose `done` flag never
-            // persisted must still be reversed, or its directory is
-            // stranded -- `apply_move`'s own classification (not the stale
-            // `done` flag) is what decides whether there is anything left
-            // to do.
+            // still waiting to be moved out of the way: every install is
+            // undone before the park that would put a directory back where
+            // that install had placed one.
+            //
+            // Every index is visited, not just those marked `done`: a move
+            // whose rename already happened before a crash but whose `done`
+            // flag never persisted must still be reversed, or its directory
+            // is stranded -- `apply_move`'s own reading of the two paths,
+            // not the stale `done` flag, is what decides whether there is
+            // anything left to do. That reading is also what keeps the
+            // common case cheap and safe: most installs reached here never
+            // ran at all, and their two ends are both still occupied.
             for index in (0..journal.moves.len()).rev() {
                 apply_move(paths, &mut journal, index, Direction::Backward)?;
             }
