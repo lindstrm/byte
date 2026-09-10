@@ -95,7 +95,14 @@ impl Default for AccountsFile {
     }
 }
 
-fn now_rfc3339() -> String {
+/// RFC 3339 timestamp, shared by every stamp this file writes (`added_at`,
+/// `last_used_at`) and, from `ops::desktop` (task 8), the `desktop_profile`
+/// capture stamp -- one clock and format for every timestamp byte writes,
+/// rather than a second helper reinventing it. `pub(crate)` rather than
+/// private: `ops::desktop` lives in a sibling module tree and needs it too,
+/// but nothing outside the crate should be able to reach into this file's
+/// internal clock.
+pub(crate) fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| String::from("unknown"))
