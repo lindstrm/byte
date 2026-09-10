@@ -217,60 +217,9 @@ impl AccountsFile {
         meta
     }
 
-    /// Find an account by label, email, or UUID prefix.
-    pub fn resolve(&self, query: &str) -> Result<&AccountMeta> {
-        let q = query.trim().to_lowercase();
-        if q.is_empty() {
-            return Err(Error::NoSuchAccount(query.to_string()));
-        }
-
-        let exact: Vec<&AccountMeta> = self
-            .accounts
-            .iter()
-            .filter(|a| {
-                a.label.to_lowercase() == q
-                    || a.email.as_deref().map(str::to_lowercase) == Some(q.clone())
-                    || a.uuid.to_lowercase() == q
-            })
-            .collect();
-
-        if exact.len() == 1 {
-            return Ok(exact[0]);
-        }
-        if exact.len() > 1 {
-            return Err(Error::AmbiguousAccount {
-                query: query.to_string(),
-                count: exact.len(),
-            });
-        }
-
-        let prefixed: Vec<&AccountMeta> = self
-            .accounts
-            .iter()
-            .filter(|a| {
-                a.uuid.to_lowercase().starts_with(&q) || a.label.to_lowercase().starts_with(&q)
-            })
-            .collect();
-
-        match prefixed.len() {
-            1 => Ok(prefixed[0]),
-            0 => Err(Error::NoSuchAccount(query.to_string())),
-            n => Err(Error::AmbiguousAccount {
-                query: query.to_string(),
-                count: n,
-            }),
-        }
-    }
-
-    /// `resolve`'s `&mut` mirror, for a caller that needs to update the
-    /// matched account in place (e.g. stamping a `desktop_profile` record
-    /// after a capture). Matches `resolve`'s lookup semantics exactly --
-    /// same exact-match fields, same ambiguity handling, same uuid/label
-    /// prefix fallback -- expressed over indices rather than collected
-    /// `&AccountMeta` references, since multiple live mutable borrows out of
-    /// `self.accounts` cannot coexist the way `resolve`'s immutable ones do.
-    /// Keep this in sync with `resolve` if its matching rules ever change.
-    pub fn resolve_mut(&mut self, query: &str) -> Result<&mut AccountMeta> {
+    /// Shared lookup logic: find an account's index by label, email, or UUID
+    /// prefix. Returns the index if exactly one match is found.
+    fn resolve_index(&self, query: &str) -> Result<usize> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
             return Err(Error::NoSuchAccount(query.to_string()));
@@ -289,7 +238,7 @@ impl AccountsFile {
             .collect();
 
         if exact.len() == 1 {
-            return Ok(&mut self.accounts[exact[0]]);
+            return Ok(exact[0]);
         }
         if exact.len() > 1 {
             return Err(Error::AmbiguousAccount {
@@ -309,13 +258,29 @@ impl AccountsFile {
             .collect();
 
         match prefixed.len() {
-            1 => Ok(&mut self.accounts[prefixed[0]]),
+            1 => Ok(prefixed[0]),
             0 => Err(Error::NoSuchAccount(query.to_string())),
             n => Err(Error::AmbiguousAccount {
                 query: query.to_string(),
                 count: n,
             }),
         }
+    }
+
+    /// Find an account by label, email, or UUID prefix.
+    pub fn resolve(&self, query: &str) -> Result<&AccountMeta> {
+        Ok(&self.accounts[self.resolve_index(query)?])
+    }
+
+    /// `resolve`'s `&mut` mirror, for a caller that needs to update the
+    /// matched account in place (e.g. stamping a `desktop_profile` record
+    /// after a capture). Matches `resolve`'s lookup semantics exactly --
+    /// same exact-match fields, same ambiguity handling, same uuid/label
+    /// prefix fallback. Uses the shared [`Self::resolve_index`] to ensure
+    /// both lookup paths always agree.
+    pub fn resolve_mut(&mut self, query: &str) -> Result<&mut AccountMeta> {
+        let i = self.resolve_index(query)?;
+        Ok(&mut self.accounts[i])
     }
 
     pub fn rename(&mut self, uuid: &str, label: &str) -> Result<AccountMeta> {

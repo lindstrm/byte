@@ -90,6 +90,27 @@ fn resolve_rejects_an_empty_query_even_with_exactly_one_account() {
 }
 
 #[test]
+fn resolve_mut_reports_an_unknown_name() {
+    let mut file = AccountsFile::default();
+    assert!(matches!(
+        file.resolve_mut("nobody"),
+        Err(Error::NoSuchAccount(_))
+    ));
+}
+
+#[test]
+fn resolve_mut_reports_ambiguity_rather_than_guessing() {
+    let mut file = AccountsFile::default();
+    file.upsert_from("aaa111", &snap("aaa111", "x@example.com"));
+    file.upsert_from("aaa222", &snap("aaa222", "y@example.com"));
+
+    assert!(matches!(
+        file.resolve_mut("aaa"),
+        Err(Error::AmbiguousAccount { count: 2, .. })
+    ));
+}
+
+#[test]
 fn remove_deletes_the_account_and_clears_active_when_it_matches() {
     let mut file = AccountsFile::default();
     file.upsert_from("u1", &snap("u1", "a@example.com"));
