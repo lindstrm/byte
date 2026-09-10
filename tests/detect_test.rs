@@ -195,5 +195,8 @@ fn a_fake_probe_reports_the_desktop_app_state_it_was_given() {
     assert!(!FakeProbe::with_desktop(2, false).desktop_app_running());
     // The two readings are independent: sessions running does not imply the
     // app is, and vice versa.
-    assert_eq!(FakeProbe::with_desktop(2, true).running_claude_sessions(), 2);
+    assert_eq!(
+        FakeProbe::with_desktop(2, true).running_claude_sessions(),
+        2
+    );
 }

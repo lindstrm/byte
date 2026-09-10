@@ -192,7 +192,10 @@ pub struct FakeProbe {
 
 impl FakeProbe {
     pub fn with_count(count: usize) -> Self {
-        Self { count, desktop: false }
+        Self {
+            count,
+            desktop: false,
+        }
     }
 
     pub fn with_desktop(count: usize, desktop: bool) -> Self {

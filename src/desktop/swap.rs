@@ -131,25 +131,22 @@ fn exists(path: &Path) -> Result<bool> {
 ///   recording it did not. Treat it as a no-op success rather than failing
 ///   on a source that predictably no longer exists.
 /// - both occupied, undoing (`Backward`) -> leave the disk alone and leave
-///   `done` as it is. Two situations produce this state, and the reverse
-///   walk order is what makes a no-op right for both:
-///     1. The move never ran. This is far from exotic -- it is the resting
-///        state of every install move throughout the whole park stage: the
-///        incoming profile is still in its store and the live directory it
-///        would replace has not been parked yet.
-///     2. A *later* move re-occupied this move's destination. A park of
-///        name N has destination `live/N`, which the install of the same
-///        name re-fills; so a park can be both-occupied even with
-///        `done: true`.
-///   Case 2 is safe ONLY because `Journal::plan` emits every park before
-///   every install and `recover_if_interrupted` walks in reverse, so any
-///   later move that re-occupied this destination has already been undone
-///   by the time this one is visited. That ordering is the guarantee --
-///   not, as an earlier version of this comment claimed, that a swap can
-///   never re-occupy a destination. **Do not reorder or parallelise the
-///   reverse loop**: doing so reintroduces the stranded-directory bug this
-///   arm exists to prevent.
-///
+///   `done` as it is. Two situations produce this state. The first is that
+///   the move never ran, which is far from exotic: it is the resting state
+///   of every install move throughout the whole park stage, where the
+///   incoming profile is still in its store and the live directory it
+///   would replace has not been parked yet. The second is that a *later*
+///   move re-occupied this move's destination -- a park of name N has
+///   destination `live/N`, which the install of the same name re-fills, so
+///   a park can be both-occupied even with `done: true`.
+///   That second case is safe ONLY because `Journal::plan` emits every
+///   park before every install and `recover_if_interrupted` walks in
+///   reverse, so any later move that re-occupied this destination has
+///   already been undone by the time this one is visited. The walk order
+///   is the guarantee -- not, as an earlier version of this comment
+///   claimed, that a swap can never re-occupy a destination. Do not
+///   reorder or parallelise the reverse loop: doing so reintroduces the
+///   stranded-directory bug this arm exists to prevent.
 ///   Renaming here would instead collide with the occupied destination,
 ///   and the resulting error escaping recovery would strand the journal on
 ///   disk for every later byte command to trip over -- which is exactly
