@@ -13,9 +13,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use byte::Error;
+use byte::claude::detect::FakeProbe;
 use byte::claude::files::ClaudeFiles;
 use byte::claude::snapshot::SCHEMA_VERSION;
-use byte::cli::run::{cmd_add, resolve_add_failure, running_sessions_warning, switch_json};
+use byte::cli::run::{
+    cmd_add, cmd_switch, format_size, resolve_add_failure, running_sessions_warning, switch_json,
+};
+use byte::desktop::paths::{DesktopPaths, TestDesktopPaths};
 use byte::lock::MutationGuard;
 use byte::ops::switch::{SwitchOutcome, Switcher, SyncOutcome};
 use byte::paths::{HostPaths, TestPaths};
@@ -324,4 +328,178 @@ fn cmd_add_settles_confirmation_before_taking_the_mutation_lock() {
         matches!(result, Err(Error::ConfirmationRequired { .. })),
         "the confirmation gate must precede the lock; got {result:?}"
     );
+}
+
+// The tests below cover Task 9's desktop wiring in `cmd_switch`: the
+// desktop half runs after the Claude Code switch commits, is skipped when
+// there is no `DesktopPaths` to attempt it against, and never turns a
+// failure of its own into a failure of the switch that already committed.
+// Driven directly against `cmd_switch` with a `MemoryStore`, exactly like
+// `cmd_add_restores_the_previous_account_when_poll_once_fails` above --
+// `tests/cli_test.rs` cannot exercise a SUCCESSFUL switch through the
+// compiled binary at all, since that reaches a real OS keychain (see that
+// file's own header comment).
+
+#[test]
+fn cmd_switch_moves_the_desktop_profile_too() {
+    // Proves the actual wiring this task adds: cmd_switch must call
+    // switch_desktop with the outgoing/incoming uuids the Claude Code
+    // switch just settled, not skip it or get the direction backwards.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    login_as(&tp, "u1", "a@example.com", "r1");
+    let sw = Switcher::new(&tp, MemoryStore::new());
+    sw.capture_current().unwrap();
+    login_as(&tp, "u2", "b@example.com", "r2");
+    sw.capture_current().unwrap();
+
+    // u2 is live right now, with a session in the desktop app; u1 has a
+    // previously stored desktop profile waiting to be installed.
+    let live = dp.desktop_dir().join("Network");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("marker.txt"), "account-u2").unwrap();
+    let stored = tp.desktop_profile_dir("u1").join("Network");
+    std::fs::create_dir_all(&stored).unwrap();
+    std::fs::write(stored.join("marker.txt"), "account-u1").unwrap();
+
+    let result = cmd_switch(
+        &sw,
+        "a@example.com",
+        false,
+        &FakeProbe::with_count(0),
+        Some(&dp),
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-u1",
+        "the desktop half must have installed u1's stored session"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tp.desktop_profile_dir("u2").join("Network/marker.txt")).unwrap(),
+        "account-u2",
+        "u2's session must have been parked, not discarded"
+    );
+}
+
+#[test]
+fn a_failing_desktop_half_does_not_fail_the_already_committed_switch() {
+    // Regression guard for the rule stated on `switch_desktop`'s call site
+    // in `cmd_switch`: a desktop failure must never turn an
+    // already-committed Claude Code switch into an `Err` -- the same
+    // "never fail an operation that already succeeded" rule `notify::send`
+    // and `atomic::prune` already follow elsewhere in this codebase.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    login_as(&tp, "u1", "a@example.com", "r1");
+    let sw = Switcher::new(&tp, MemoryStore::new());
+    sw.capture_current().unwrap();
+    login_as(&tp, "u2", "b@example.com", "r2");
+    sw.capture_current().unwrap();
+
+    // Force switch_desktop to fail deterministically, before it writes
+    // anything: an unrepaired journal already on disk, which switch_desktop
+    // refuses to start a new swap over (see its precondition check in
+    // src/ops/desktop.rs).
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), "not a real journal").unwrap();
+
+    let result = cmd_switch(
+        &sw,
+        "a@example.com",
+        false,
+        &FakeProbe::with_count(0),
+        Some(&dp),
+    );
+
+    assert!(
+        result.is_ok(),
+        "a failing desktop half must not fail an already-committed Claude Code switch: {result:?}"
+    );
+    // The property the rule actually protects: the Claude Code switch
+    // really did commit, not just "some Ok(()) came back".
+    let creds: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tp.claude_credentials()).unwrap()).unwrap();
+    assert_eq!(creds["claudeAiOauth"]["refreshToken"], json!("r1"));
+}
+
+#[test]
+fn cmd_switch_skips_the_desktop_half_when_no_desktop_paths_are_available() {
+    // Mirrors production: `RealDesktopPaths::discover()` fails on every
+    // platform with no `%APPDATA%\Claude` concept (every non-Windows
+    // machine, absent CLAUDE_DESKTOP_DIR), and `run()` degrades that to
+    // `None` rather than failing `byte switch` outright. `cmd_switch` must
+    // then not create or touch anything under byte's desktop store.
+    let tp = TestPaths::new().unwrap();
+    login_as(&tp, "u1", "a@example.com", "r1");
+    let sw = Switcher::new(&tp, MemoryStore::new());
+    sw.capture_current().unwrap();
+    login_as(&tp, "u2", "b@example.com", "r2");
+    sw.capture_current().unwrap();
+
+    let no_desktop: Option<&TestDesktopPaths> = None;
+    let result = cmd_switch(
+        &sw,
+        "a@example.com",
+        false,
+        &FakeProbe::with_count(0),
+        no_desktop,
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    let creds: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tp.claude_credentials()).unwrap()).unwrap();
+    assert_eq!(creds["claudeAiOauth"]["refreshToken"], json!("r1"));
+    assert!(
+        !tp.desktop_store_dir().exists(),
+        "no desktop paths means the desktop half must not run at all"
+    );
+}
+
+#[test]
+fn cmd_switch_never_touches_the_desktop_half_in_json_mode() {
+    // The --json path returns before ever inspecting `desktop` (see
+    // `cmd_switch`'s own doc comment): a script gets exactly the same
+    // `switch_json` payload it got before this task, and the desktop half
+    // is not attempted for it at all. `desktop_store_dir()` not existing
+    // afterward is a strong signal that `switch_desktop` never ran: even a
+    // park with nothing movable to file still creates that directory (see
+    // `ops::desktop::switch_desktop`'s own doc comment).
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    login_as(&tp, "u1", "a@example.com", "r1");
+    let sw = Switcher::new(&tp, MemoryStore::new());
+    sw.capture_current().unwrap();
+    login_as(&tp, "u2", "b@example.com", "r2");
+    sw.capture_current().unwrap();
+
+    let result = cmd_switch(
+        &sw,
+        "a@example.com",
+        true,
+        &FakeProbe::with_count(0),
+        Some(&dp),
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    // The Claude Code switch itself still committed under --json.
+    let creds: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tp.claude_credentials()).unwrap()).unwrap();
+    assert_eq!(creds["claudeAiOauth"]["refreshToken"], json!("r1"));
+    assert!(
+        !tp.desktop_store_dir().exists(),
+        "the desktop half must not run at all in --json mode, even with desktop paths available"
+    );
+}
+
+#[test]
+fn format_size_reports_bytes_plainly_under_a_kilobyte() {
+    assert_eq!(format_size(0), "0 B");
+    assert_eq!(format_size(512), "512 B");
+}
+
+#[test]
+fn format_size_reports_larger_sizes_with_one_decimal_and_a_unit() {
+    assert_eq!(format_size(2 * 1024 * 1024), "2.0 MB");
 }

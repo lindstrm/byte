@@ -29,7 +29,7 @@ what's quoted here.
 | `byte add needs confirmation; re-run with --yes to proceed without prompting` | `byte add` logs Claude Code out before it starts waiting for a new login, so it refuses to do that unattended: standard input isn't a terminal (a script, cron, or CI), or `--json` is set (a prompt would corrupt machine-readable output). Nothing was logged out — the check runs before the logout, not after it. | Re-run with `--yes` if you're sure, or run it interactively without `--json` to be prompted instead. |
 | `byte remove needs confirmation; re-run with --yes to proceed without prompting` | `byte remove` deletes a keychain entry with no backup, so it refuses to run unattended: standard input isn't a terminal (a script, cron, or CI), or `--json` is set (a prompt would corrupt machine-readable output). | Re-run with `--yes` if you're sure, or run it interactively without `--json` to be prompted instead. |
 | `another byte process is currently changing accounts...` | Another byte process — often the tray — already holds the mutation lock (`mutation.lock` in byte's config directory) because it's mid-switch, mid-capture, or mid-add/remove/rename. byte refused to start a second write sequence rather than risk two processes interleaving writes to the same files. Nothing was read or changed. | Wait for the other process to finish, then retry. Usually that is instant — but a `byte add` waiting for its new login holds the lock for as long as it waits (up to `--timeout`, 300 seconds by default), and the tray reports Busy for that whole window. The lock is an OS-level advisory lock tied to that process's open file handle, so it is always released automatically if that process exits or crashes — there is no lock file to delete by hand. |
-| `a desktop profile swap was interrupted and could not be repaired automatically` | byte was interrupted while moving the Claude desktop app's session between accounts. The journal recording that swap is either unreadable, was written by a newer version of byte, or — if this appears right as a switch starts — is simply still sitting on disk from that earlier interruption; byte refuses to start a new swap on top of one that was never repaired, since that would destroy the only record of it while its files may already be half-moved. That refusal is checked before byte writes anything at all, so a switch refused this way changed nothing. Your session data is still on disk — nothing is deleted by a swap, only moved. | Do not delete the journal. Upgrade byte if the message says the format is newer. If it says an earlier swap was never repaired, run any byte command (recovery runs automatically at the start of every command, e.g. `byte list`) and then retry. Otherwise the journal lists every `from`/`to` pair byte intended, so the move can be completed or reversed by hand. |
+| `a desktop profile swap was interrupted and could not be repaired automatically` | byte was interrupted while moving the Claude desktop app's session between accounts. The journal recording that swap is either unreadable, was written by a newer version of byte, or — if this appears right as a switch starts — is simply still sitting on disk from that earlier interruption; byte refuses to start a new swap on top of one that was never repaired, since that would destroy the only record of it while its files may already be half-moved. That refusal is checked before byte writes anything at all, so a switch refused this way changed nothing. Your session data is still on disk — nothing is deleted by a swap, only moved. This never exits non-zero by itself: automatic recovery at the start of every command catches this exact failure and prints it as a warning (`an earlier desktop profile swap could not be repaired automatically, so this command is continuing without touching it: ...`) rather than blocking the command you actually ran, and `byte switch` catches it the same way (see the desktop-switch bullet below) rather than undoing a Claude Code switch that already committed. | Do not delete the journal. Upgrade byte if the message says the format is newer. If it says an earlier swap was never repaired, run any byte command (recovery runs automatically at the start of every command, e.g. `byte list`) and then retry. Otherwise the journal lists every `from`/`to` pair byte intended, so the move can be completed or reversed by hand. |
 
 A few behaviors worth calling out even though they aren't errors:
 
@@ -44,6 +44,60 @@ A few behaviors worth calling out even though they aren't errors:
   account's stored profile and its size. byte reports it rather than turning
   a switch that fully happened into an error you would have nothing to
   retry. The record is rewritten by the next switch that parks this account.
+- **`byte switch` also switches the Claude desktop app's session**, right
+  after the Claude Code switch itself completes. What it reports on stderr:
+  - **`Claude desktop app switched too.`** — the desktop half moved as well.
+  - **`Claude is running, so its desktop session was left on the previous
+    account. Quit Claude and run this switch again to move it too.`** —
+    Chromium corrupts profile state if its directories move underneath a
+    running process, so byte refuses to touch them while the app is open.
+    Nothing was changed; quit Claude Desktop and re-run the same switch.
+  - **`No desktop session stored for this account yet, so Claude will open
+    signed out. Sign in there once and byte will remember it.`** — this
+    account has no captured desktop profile yet (it has never been the
+    outgoing side of a switch while signed in to Claude Desktop). Sign in
+    once and the next switch away from it captures one.
+  - **`the Claude Code switch succeeded, but its desktop app session could
+    not be switched: ...`** — the desktop half hit an error (for example, an
+    unrepaired journal from an earlier interruption — see
+    `DesktopSwapInterrupted` above). This is a warning, not a failure: the
+    Claude Code switch you asked for already happened and is not undone by a
+    problem in this second, best-effort half. Re-run `byte switch` (or any
+    byte command, to trigger recovery first) once the underlying problem is
+    resolved.
+
+  On a machine with no `%APPDATA%\Claude` at all — every non-Windows
+  platform today, unless `CLAUDE_DESKTOP_DIR` is set — none of the above
+  appears; the desktop half is silently skipped rather than warning on every
+  single switch about a directory that will never exist there.
+
+  **`byte switch --json` does not attempt the desktop half at all** in this
+  release — a script gets exactly the same `switch_json` payload it always
+  has, with no `desktop_profile`-style field and none of the four messages
+  above on stderr either. The Claude Code switch itself still happens
+  normally; only the desktop app's session is left untouched. Use a plain
+  `byte switch` (without `--json`) when you need the desktop app to follow.
+- **`repaired an interrupted desktop profile swap (RollForward)` /
+  `(Reverse)`** on `byte list` or any other command is a confirmation, not an
+  error: it means an earlier `byte switch` was interrupted mid-swap, and this
+  command's automatic recovery (see `DesktopSwapInterrupted` above) just
+  finished either completing the install (`RollForward`) or undoing the
+  parks (`Reverse`). Nothing further is needed.
+- **`an earlier desktop profile swap could not be repaired automatically, so
+  this command is continuing without touching it: ...`** is what every byte
+  command prints instead of the confirmation above when automatic recovery
+  itself fails (an unreadable journal, or one written by an incompatible
+  format version — see `DesktopSwapInterrupted` above). The command you
+  actually ran (`byte list`, `byte current`, `byte switch`, ...) still
+  completes normally; only the stale journal is left exactly as it was. This
+  is deliberate: letting a broken journal fail every single byte command
+  would turn one corrupt file into total unavailability of the whole CLI.
+  Follow `DesktopSwapInterrupted`'s own fix above to actually resolve it.
+- **`byte list` marks accounts with a stored desktop session** and its size
+  on disk (`[desktop session: 12.3 MB]`), and `--json` reports the same
+  record under a `desktop_profile` key — `null` for an account that has
+  never had one captured, or `{"captured_at": ..., "bytes": ...}` once it
+  has.
 - **Removing the active account** is allowed, once confirmed (see
   `byte remove` above). `byte` stops tracking it as active, but Claude Code
   itself is left logged in as that account's credentials until you run

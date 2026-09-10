@@ -5,9 +5,11 @@ use std::io::IsTerminal as _;
 use crate::autostart;
 use crate::claude::detect::{ProcessProbe, SysinfoProbe};
 use crate::cli::{AutostartAction, Cli, Command};
+use crate::desktop::paths::{DesktopPaths, RealDesktopPaths};
 use crate::error::{Error, Result};
 use crate::lock::MutationGuard;
 use crate::ops::add::AddSession;
+use crate::ops::desktop::{DesktopOutcome, switch_desktop};
 use crate::ops::manage::{self, AccountListing};
 use crate::ops::switch::{SwitchOutcome, Switcher, SyncOutcome};
 use crate::output;
@@ -20,6 +22,41 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500)
 
 pub fn run(cli: Cli) -> Result<()> {
     let paths = RealPaths::discover()?;
+
+    // A half-completed desktop swap must be repaired by whatever byte
+    // command runs next, not only by a retry of the `switch` that was
+    // interrupted -- so this runs here, before the dispatch below (and
+    // before the tray-vs-CLI fork just past it), rather than being folded
+    // into `cmd_switch`. Safe to run unconditionally on every command and
+    // every platform: `desktop_journal_file` lives under byte's OWN config
+    // directory (via `HostPaths`, already resolved above), never under the
+    // desktop app's real `%APPDATA%\Claude` -- a machine that has never run
+    // a desktop swap has no such file, so this is a cheap `Ok(None)` the
+    // rest of the time.
+    //
+    // A recovery FAILURE (an unreadable journal, or one written by an
+    // incompatible format version) must not be allowed to propagate via
+    // `?` here: this runs before every command, including read-only ones
+    // that never touch the desktop machinery at all (`list`, `current`,
+    // `autostart`, even starting the tray with no arguments). Letting it
+    // fail `run()` would turn one corrupt file into total unavailability
+    // of the whole CLI, with no way to run byte again short of editing the
+    // journal by hand -- there is no weaker mode this reduces to. `switch`
+    // keeps its own, narrower protection regardless of what happens here:
+    // `switch_desktop`'s own precondition check still refuses to start a
+    // NEW swap over an unrepaired journal, and that refusal is reported
+    // the same "catch and warn" way by `report_desktop_outcome`, without
+    // failing the Claude Code switch that already committed.
+    match crate::desktop::swap::recover_if_interrupted(&paths) {
+        Ok(Some(recovery)) => output::warn(&format!(
+            "repaired an interrupted desktop profile swap ({recovery:?})."
+        )),
+        Ok(None) => {}
+        Err(e) => output::warn(&format!(
+            "an earlier desktop profile swap could not be repaired automatically, so this \
+             command is continuing without touching it: {e}"
+        )),
+    }
 
     // No arguments starts the tray rather than listing accounts (see
     // `Cli::long_about`). Handled before `Switcher` even exists: `tray::run`
@@ -48,7 +85,22 @@ pub fn run(cli: Cli) -> Result<()> {
             // alive until this arm's block ends, which is after the command
             // completes.
             let _guard = MutationGuard::acquire(&paths)?;
-            cmd_switch(&switcher, &name, cli.json, &probe)
+
+            // `RealDesktopPaths::discover` fails when neither
+            // `CLAUDE_DESKTOP_DIR` nor `%APPDATA%` is set, which is the
+            // ordinary state of every non-Windows machine -- this feature
+            // only understands the Windows desktop app's layout (see
+            // `src/desktop/paths.rs`). `.ok()` degrades that to "the
+            // desktop half is not attempted" rather than failing `byte
+            // switch` outright: the desktop switch is an addition to the
+            // Claude Code switch, never a precondition for it, and warning
+            // about a directory that will never exist on those platforms
+            // on every single invocation would be permanent noise, not a
+            // fixable problem. A genuine failure to switch the desktop
+            // half once paths ARE available is a different matter, and is
+            // reported -- see `cmd_switch`'s own handling.
+            let desktop = RealDesktopPaths::discover().ok();
+            cmd_switch(&switcher, &name, cli.json, &probe, desktop.as_ref())
         }
         Command::Capture => {
             let _guard = MutationGuard::acquire(&paths)?;
@@ -78,6 +130,12 @@ fn listing_json(l: &AccountListing) -> serde_json::Value {
         "uuid": l.meta.uuid,
         "active": l.active,
         "last_used_at": l.meta.last_used_at,
+        // `DesktopProfileRecord` derives `Serialize`, so `None` becomes the
+        // JSON literal `null` here -- explicitly, as a key every object
+        // carries, never omitted. An account with no stored desktop
+        // profile is not the same fact as a script that can't tell whether
+        // byte's build even knows about the field.
+        "desktop_profile": l.meta.desktop_profile,
     })
 }
 
@@ -101,9 +159,37 @@ fn cmd_list<P: HostPaths + Copy, S: SecretStore>(sw: &Switcher<P, S>, json: bool
     for l in &listing {
         let mark = if l.active { "*" } else { " " };
         let org = l.meta.organization_name.as_deref().unwrap_or("-");
-        output::info(&format!("{mark} {}  ({org})", l.meta.label));
+        match &l.meta.desktop_profile {
+            Some(rec) => output::info(&format!(
+                "{mark} {}  ({org})  [desktop session: {}]",
+                l.meta.label,
+                format_size(rec.bytes)
+            )),
+            None => output::info(&format!("{mark} {}  ({org})", l.meta.label)),
+        }
     }
     Ok(())
+}
+
+/// A human-readable size for `byte list`'s desktop-session note. Display
+/// only: `--json` reports the raw byte count in `desktop_profile.bytes`
+/// instead, which is what a script should parse.
+///
+/// `pub`, like `switch_json` and `running_sessions_warning`, specifically so
+/// `tests/cli_run_test.rs` can pin its exact formatting directly.
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 fn cmd_current<P: HostPaths + Copy, S: SecretStore>(sw: &Switcher<P, S>, json: bool) -> Result<()> {
@@ -205,14 +291,34 @@ pub fn running_sessions_warning(count: usize) -> Option<String> {
     }
 }
 
-fn cmd_switch<P: HostPaths + Copy, S: SecretStore>(
+/// `pub`, like `cmd_add`, specifically so `tests/cli_run_test.rs` can drive
+/// it end to end against a `MemoryStore` and a `TestDesktopPaths`. A
+/// SUCCESSFUL switch through the compiled binary reaches `secrets.get()`,
+/// which for that binary is the developer's real OS keychain (see
+/// `tests/cli_test.rs`'s own header comment) -- this is the only way to
+/// exercise the desktop half's wiring, including its failure handling,
+/// without one.
+///
+/// `desktop` is `None` when no `DesktopPaths` could be discovered for this
+/// platform or environment (see `run`'s `Command::Switch` arm) -- the
+/// desktop half is then skipped entirely: it is an addition to the switch,
+/// never a precondition for it.
+pub fn cmd_switch<P: HostPaths + Copy, S: SecretStore, D: DesktopPaths>(
     sw: &Switcher<P, S>,
     name: &str,
     json: bool,
     probe: &impl ProcessProbe,
+    desktop: Option<&D>,
 ) -> Result<()> {
     let outcome = sw.switch_to(name)?;
 
+    // The desktop half is deliberately absent from --json entirely, rather
+    // than folded into this payload: `switch_json` is a stable, tested
+    // shape (`tests/cli_run_test.rs`), and the desktop outcome would need
+    // its own considered field and variants rather than being bolted on
+    // here. A script driving --json today gets exactly what it got before
+    // this task; a human running a plain `byte switch` gets the new
+    // stderr messages below.
     if json {
         output::data(&switch_json(&outcome).to_string());
         return Ok(());
@@ -232,8 +338,54 @@ fn cmd_switch<P: HostPaths + Copy, S: SecretStore>(
         if let Some(msg) = running_sessions_warning(probe.running_claude_sessions()) {
             output::warn(&msg);
         }
+
+        // Skipped for a no-op switch (the `already_active` branch above)
+        // and skipped outright when no desktop paths are available at all.
+        // `switch_desktop` also guards against a self-switch internally,
+        // but there is no reason for the CLI to even attempt it for an
+        // account that was already active.
+        if let Some(desktop) = desktop {
+            let outgoing = match &sync {
+                SyncOutcome::Updated(meta) | SyncOutcome::Captured(meta) => {
+                    Some(meta.uuid.as_str())
+                }
+                SyncOutcome::LoggedOut => None,
+            };
+            report_desktop_outcome(switch_desktop(
+                sw.paths(),
+                desktop,
+                probe,
+                outgoing,
+                &switched_to.uuid,
+            ));
+        }
     }
     Ok(())
+}
+
+/// Report the desktop half's outcome without ever turning it into a command
+/// failure. By the time this runs the Claude Code switch has already
+/// committed, and undoing that is explicitly out of scope (see
+/// `ops::desktop`'s module doc comment) -- this follows the same "never
+/// fail an operation that already succeeded" rule `notify::send` and
+/// `atomic::prune` already apply elsewhere in this codebase.
+fn report_desktop_outcome(outcome: Result<DesktopOutcome>) {
+    match outcome {
+        Ok(DesktopOutcome::Switched) => output::status("Claude desktop app switched too."),
+        Ok(DesktopOutcome::AppRunning) => output::warn(
+            "Claude is running, so its desktop session was left on the previous account. \
+             Quit Claude and run this switch again to move it too.",
+        ),
+        Ok(DesktopOutcome::NoProfileForIncoming) => output::warn(
+            "No desktop session stored for this account yet, so Claude will open signed out. \
+             Sign in there once and byte will remember it.",
+        ),
+        Ok(DesktopOutcome::NothingToDo) => {}
+        Err(e) => output::warn(&format!(
+            "the Claude Code switch succeeded, but its desktop app session could not be \
+             switched: {e}"
+        )),
+    }
 }
 
 fn cmd_capture<P: HostPaths + Copy, S: SecretStore>(sw: &Switcher<P, S>, json: bool) -> Result<()> {
