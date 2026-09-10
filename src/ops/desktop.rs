@@ -54,6 +54,16 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
     outgoing: Option<&str>,
     incoming: &str,
 ) -> Result<DesktopOutcome> {
+    // Guard: without this, a self-switch parks the live profile into the
+    // very directory it is about to install from, and clears the OAuth keys
+    // of the account the user is staying on. A first-time self-switch
+    // silently loses their OAuth keys (signing out); a repeat self-switch
+    // hits a DirectoryNotEmpty rename collision, self-healing through
+    // recovery machinery but still surfacing an Err to the caller.
+    if outgoing == Some(incoming) {
+        return Ok(DesktopOutcome::NothingToDo);
+    }
+
     // Chromium corrupts profile state if its directories move underneath a
     // running process, so this is a hard gate, not a warning.
     if probe.desktop_app_running() {

@@ -217,3 +217,60 @@ fn parking_a_profile_records_it_against_the_account() {
     );
     assert!(!rec.captured_at.is_empty());
 }
+
+#[test]
+fn switching_an_account_to_itself_changes_nothing() {
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live(&dp, "account-a");
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "a").unwrap();
+
+    assert_eq!(out, DesktopOutcome::NothingToDo);
+    // Live directory marker file must be unchanged.
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-a",
+        "self-switch must not move the live profile"
+    );
+    // Config's lastKnownAccountUuid must still be present and unchanged.
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert_eq!(
+        cfg["lastKnownAccountUuid"],
+        serde_json::json!("account-a"),
+        "self-switch must not clear the OAuth keys"
+    );
+    // No journal file should be created.
+    assert!(!dp.desktop_dir().join(".journal").exists());
+}
+
+#[test]
+fn a_self_switch_is_a_no_op_even_when_a_profile_is_already_stored() {
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live(&dp, "account-a");
+    // Pre-create a stored profile for account "a".
+    let stored = tp.desktop_profile_dir("a").join("Network");
+    std::fs::create_dir_all(&stored).unwrap();
+    std::fs::write(stored.join("marker.txt"), "account-a-stored").unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "a").unwrap();
+
+    assert_eq!(out, DesktopOutcome::NothingToDo);
+    // Live directory must remain unchanged.
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-a"
+    );
+    // Stored profile must remain untouched.
+    assert_eq!(
+        std::fs::read_to_string(tp.desktop_profile_dir("a").join("Network/marker.txt")).unwrap(),
+        "account-a-stored",
+        "stored profile must not be touched by a self-switch"
+    );
+    // Config must be unchanged.
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
+    assert_eq!(cfg["lastKnownAccountUuid"], serde_json::json!("account-a"));
+}
