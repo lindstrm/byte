@@ -17,10 +17,12 @@ use byte::claude::detect::FakeProbe;
 use byte::claude::files::ClaudeFiles;
 use byte::claude::snapshot::SCHEMA_VERSION;
 use byte::cli::run::{
-    cmd_add, cmd_switch, format_size, resolve_add_failure, running_sessions_warning, switch_json,
+    cmd_add, cmd_switch, format_size, recover_under_lock, resolve_add_failure,
+    running_sessions_warning, switch_json,
 };
 use byte::desktop::paths::{DesktopPaths, TestDesktopPaths};
 use byte::lock::MutationGuard;
+use byte::ops::desktop::DesktopOutcome;
 use byte::ops::switch::{SwitchOutcome, Switcher, SyncOutcome};
 use byte::paths::{HostPaths, TestPaths};
 use byte::store::metadata::AccountMeta;
@@ -54,7 +56,7 @@ fn switch_json_reports_a_captured_sync_outcome() {
         already_active: false,
     };
 
-    let value = switch_json(&outcome);
+    let value = switch_json(&outcome, None);
 
     assert_eq!(value["sync"]["outcome"], "captured");
     assert_eq!(value["sync"]["uuid"], "live-uuid");
@@ -71,7 +73,7 @@ fn switch_json_reports_an_updated_sync_outcome() {
         already_active: true,
     };
 
-    let value = switch_json(&outcome);
+    let value = switch_json(&outcome, None);
 
     assert_eq!(value["sync"]["outcome"], "updated");
     assert_eq!(value["already_active"], true);
@@ -85,7 +87,7 @@ fn switch_json_reports_a_logged_out_sync_outcome_without_an_account() {
         already_active: false,
     };
 
-    let value = switch_json(&outcome);
+    let value = switch_json(&outcome, None);
 
     assert_eq!(value["sync"]["outcome"], "logged_out");
     // LoggedOut carries no account -- confirm sync_json doesn't fabricate a
@@ -458,14 +460,12 @@ fn cmd_switch_skips_the_desktop_half_when_no_desktop_paths_are_available() {
 }
 
 #[test]
-fn cmd_switch_never_touches_the_desktop_half_in_json_mode() {
-    // The --json path returns before ever inspecting `desktop` (see
-    // `cmd_switch`'s own doc comment): a script gets exactly the same
-    // `switch_json` payload it got before this task, and the desktop half
-    // is not attempted for it at all. `desktop_store_dir()` not existing
-    // afterward is a strong signal that `switch_desktop` never ran: even a
-    // park with nothing movable to file still creates that directory (see
-    // `ops::desktop::switch_desktop`'s own doc comment).
+fn cmd_switch_moves_the_desktop_profile_in_json_mode_too() {
+    // Review finding: `--json` used to return before the desktop block was
+    // reached, so a script driving `byte switch --json` was left with Claude
+    // Desktop still signed in as the previous account -- and nothing in the
+    // payload said so. The desktop half now runs for both output modes; only
+    // the reporting differs.
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
     login_as(&tp, "u1", "a@example.com", "r1");
@@ -473,6 +473,13 @@ fn cmd_switch_never_touches_the_desktop_half_in_json_mode() {
     sw.capture_current().unwrap();
     login_as(&tp, "u2", "b@example.com", "r2");
     sw.capture_current().unwrap();
+
+    let live = dp.desktop_dir().join("Network");
+    std::fs::create_dir_all(&live).unwrap();
+    std::fs::write(live.join("marker.txt"), "account-u2").unwrap();
+    let stored = tp.desktop_profile_dir("u1").join("Network");
+    std::fs::create_dir_all(&stored).unwrap();
+    std::fs::write(stored.join("marker.txt"), "account-u1").unwrap();
 
     let result = cmd_switch(
         &sw,
@@ -487,9 +494,230 @@ fn cmd_switch_never_touches_the_desktop_half_in_json_mode() {
     let creds: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(tp.claude_credentials()).unwrap()).unwrap();
     assert_eq!(creds["claudeAiOauth"]["refreshToken"], json!("r1"));
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-u1",
+        "--json must install the incoming account's stored desktop session too"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tp.desktop_profile_dir("u2").join("Network/marker.txt")).unwrap(),
+        "account-u2",
+        "...and park the outgoing account's, not discard it"
+    );
+}
+
+#[test]
+fn a_failing_desktop_half_does_not_fail_a_json_switch_either() {
+    // The desktop half must never fail the command in EITHER output mode:
+    // under --json the failure becomes `"desktop": "failed"` (pinned by
+    // `switch_json_reports_a_failed_desktop_half` below) plus the same
+    // stderr warning, and stdout still carries a valid payload.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    login_as(&tp, "u1", "a@example.com", "r1");
+    let sw = Switcher::new(&tp, MemoryStore::new());
+    sw.capture_current().unwrap();
+    login_as(&tp, "u2", "b@example.com", "r2");
+    sw.capture_current().unwrap();
+
+    // The same deterministic failure the non-JSON test above uses: an
+    // unrepaired journal, which switch_desktop refuses to swap over.
+    std::fs::create_dir_all(tp.desktop_store_dir()).unwrap();
+    std::fs::write(tp.desktop_journal_file(), "not a real journal").unwrap();
+
+    let result = cmd_switch(
+        &sw,
+        "a@example.com",
+        true,
+        &FakeProbe::with_count(0),
+        Some(&dp),
+    );
+
     assert!(
-        !tp.desktop_store_dir().exists(),
-        "the desktop half must not run at all in --json mode, even with desktop paths available"
+        result.is_ok(),
+        "a failing desktop half must not fail a --json switch either: {result:?}"
+    );
+    let creds: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(tp.claude_credentials()).unwrap()).unwrap();
+    assert_eq!(creds["claudeAiOauth"]["refreshToken"], json!("r1"));
+}
+
+// `desktop_json`'s mapping is pinned through `switch_json`, the payload a
+// script actually parses, rather than as a private helper: what matters is
+// the field's name and its value in the real envelope, not that some
+// function returns a string.
+
+#[test]
+fn switch_json_payload_parses_and_carries_the_desktop_outcome() {
+    let outcome = SwitchOutcome {
+        switched_to: meta("target-uuid", "work"),
+        sync: SyncOutcome::Updated(meta("live-uuid", "personal")),
+        already_active: false,
+    };
+
+    // Round-tripped through text on purpose: `--json` writes this to stdout
+    // and a script parses it back, so the contract is what survives that.
+    let text = switch_json(&outcome, Some(&Ok(DesktopOutcome::Switched))).to_string();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).expect("--json stdout must stay parseable");
+
+    assert_eq!(parsed["desktop"], json!("switched"));
+    assert_eq!(parsed["switched_to"], json!("work"));
+    assert_eq!(parsed["sync"]["outcome"], json!("updated"));
+}
+
+#[test]
+fn switch_json_names_every_desktop_outcome_in_lower_snake_case() {
+    let outcome = SwitchOutcome {
+        switched_to: meta("target-uuid", "work"),
+        sync: SyncOutcome::LoggedOut,
+        already_active: false,
+    };
+    let field = |d| switch_json(&outcome, Some(&Ok(d)))["desktop"].clone();
+
+    assert_eq!(field(DesktopOutcome::Switched), json!("switched"));
+    assert_eq!(field(DesktopOutcome::AppRunning), json!("app_running"));
+    assert_eq!(
+        field(DesktopOutcome::NoProfileForIncoming),
+        json!("no_profile_for_incoming")
+    );
+    assert_eq!(
+        field(DesktopOutcome::IdentityMismatch),
+        json!("identity_mismatch")
+    );
+    assert_eq!(field(DesktopOutcome::NothingToDo), json!("nothing_to_do"));
+}
+
+#[test]
+fn switch_json_reports_a_failed_desktop_half() {
+    // A desktop failure never fails the command, so the payload is the only
+    // machine-readable place it can appear. The error's own text is
+    // deliberately NOT in the payload: `Error`'s Display is for humans and
+    // its wording is not a contract.
+    let outcome = SwitchOutcome {
+        switched_to: meta("target-uuid", "work"),
+        sync: SyncOutcome::LoggedOut,
+        already_active: false,
+    };
+
+    let value = switch_json(&outcome, Some(&Err(Error::NotLoggedIn)));
+
+    assert_eq!(value["desktop"], json!("failed"));
+}
+
+#[test]
+fn switch_json_reports_a_desktop_half_that_was_not_attempted_as_null() {
+    // "Not attempted" (an already-active no-op, or a platform with no
+    // desktop paths at all) is a different fact from "this build has never
+    // heard of the field", so the key is always present -- explicitly null,
+    // exactly like `listing_json`'s `desktop_profile`.
+    let outcome = SwitchOutcome {
+        switched_to: meta("target-uuid", "work"),
+        sync: SyncOutcome::Updated(meta("target-uuid", "work")),
+        already_active: true,
+    };
+
+    let value = switch_json(&outcome, None);
+
+    assert!(
+        value.get("desktop").is_some(),
+        "the key must be present even when the desktop half was not attempted"
+    );
+    assert_eq!(value["desktop"], serde_json::Value::Null);
+}
+
+#[test]
+fn recovery_is_skipped_while_another_process_holds_the_mutation_lock() {
+    // Review finding: recovery used to run before any lock was taken, and
+    // `list`/`current`/`autostart` never take one at all -- so a `byte list`
+    // during an ordinary `byte switch` would read the SWITCH'S OWN live
+    // journal (written before the first rename, cleared only after the
+    // last), see no completed install, compute `Recovery::Reverse`, rename
+    // the directories backwards underneath the running swap, and then clear
+    // the only record of it.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+
+    // Exactly the state `swap::execute` is in mid-swap: the park has landed,
+    // no install has, and the full journal is on disk.
+    let parked = tp.desktop_profile_dir("u1").join("Network");
+    std::fs::create_dir_all(&parked).unwrap();
+    std::fs::write(parked.join("marker.txt"), "account-1").unwrap();
+    let journal = json!({
+        "version": 1,
+        "outgoing": "u1",
+        "incoming": null,
+        "moves": [{
+            "stage": "Park",
+            "from": dp.desktop_dir().join("Network"),
+            "to": parked,
+            "done": true
+        }]
+    })
+    .to_string();
+    std::fs::write(tp.desktop_journal_file(), &journal).unwrap();
+
+    // Stands in for the other byte process that is mid-swap right now: the
+    // lock is per open file handle, so this refuses a second acquisition
+    // even from the same process (see tests/lock_test.rs).
+    let _held = MutationGuard::acquire(&tp).expect("the lock must start free");
+
+    recover_under_lock(&tp);
+
+    assert_eq!(
+        std::fs::read_to_string(tp.desktop_journal_file()).unwrap_or_default(),
+        journal,
+        "the in-flight swap's journal must be left byte-for-byte as it was, not cleared"
+    );
+    assert_eq!(
+        std::fs::read_to_string(parked.join("marker.txt")).unwrap(),
+        "account-1",
+        "the parked directory must not be renamed backwards under the running swap"
+    );
+    assert!(
+        !dp.desktop_dir().join("Network").exists(),
+        "nothing may be restored into the live directory while the swap owning it runs"
+    );
+}
+
+#[test]
+fn recovery_still_runs_when_the_lock_is_free() {
+    // The other half of the gate: with no other process mid-mutation, a
+    // journal on disk really is wreckage and must still be repaired -- the
+    // fix must not have turned recovery off altogether.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+
+    let parked = tp.desktop_profile_dir("u1").join("Network");
+    std::fs::create_dir_all(&parked).unwrap();
+    std::fs::write(parked.join("marker.txt"), "account-1").unwrap();
+    std::fs::write(
+        tp.desktop_journal_file(),
+        json!({
+            "version": 1,
+            "outgoing": "u1",
+            "incoming": null,
+            "moves": [{
+                "stage": "Park",
+                "from": dp.desktop_dir().join("Network"),
+                "to": parked,
+                "done": true
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    recover_under_lock(&tp);
+
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-1",
+        "no install completed, so the park must be reversed and the session restored"
+    );
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "a repaired journal must be cleared, or every later command repeats the repair"
     );
 }
 

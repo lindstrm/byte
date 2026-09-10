@@ -19,13 +19,22 @@ fn sample_snapshot(uuid: &str) -> AccountSnapshot {
     )
 }
 
-fn seed_live(d: &TestDesktopPaths, marker: &str) {
+/// A live desktop session signed in as `uuid`, with `account-<uuid>` written
+/// into the profile tree so a later assertion can tell whose session moved.
+///
+/// The uuid written into `config.json` is the SAME string the caller passes
+/// to `switch_desktop` as `outgoing`. That is not cosmetic: byte now refuses
+/// to park a live session whose `lastKnownAccountUuid` names a different
+/// account than the one it is filing it under, so a fixture that signs the
+/// app in as `account-a` while calling the account `a` is modelling the
+/// desynchronised state, not the ordinary one.
+fn seed_live(d: &TestDesktopPaths, uuid: &str) {
     let dir = d.desktop_dir().join("Network");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("marker.txt"), marker).unwrap();
+    std::fs::write(dir.join("marker.txt"), format!("account-{uuid}")).unwrap();
     std::fs::write(
         d.config_file(),
-        serde_json::json!({"lastKnownAccountUuid": marker, "locale": "en-GB"}).to_string(),
+        serde_json::json!({"lastKnownAccountUuid": uuid, "locale": "en-GB"}).to_string(),
     )
     .unwrap();
 }
@@ -34,7 +43,7 @@ fn seed_live(d: &TestDesktopPaths, marker: &str) {
 fn a_running_app_blocks_the_desktop_half_and_changes_nothing() {
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
 
     let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, true), Some("a"), "b").unwrap();
 
@@ -51,7 +60,7 @@ fn a_running_app_blocks_the_desktop_half_and_changes_nothing() {
 fn switching_to_an_uncaptured_account_parks_the_old_one_and_leaves_the_app_signed_out() {
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
 
     let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b").unwrap();
 
@@ -73,7 +82,7 @@ fn switching_to_an_uncaptured_account_parks_the_old_one_and_leaves_the_app_signe
 fn switching_to_a_captured_account_restores_its_session() {
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
     let stored = tp.desktop_profile_dir("b").join("Network");
     std::fs::create_dir_all(&stored).unwrap();
     std::fs::write(stored.join("marker.txt"), "account-b").unwrap();
@@ -96,7 +105,7 @@ fn a_round_trip_returns_the_original_session_intact() {
     // Park A, switch to B, switch back: A's tree must be exactly what it was.
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
     let probe = FakeProbe::with_desktop(0, false);
 
     switch_desktop(&tp, &dp, &probe, Some("a"), "b").unwrap();
@@ -121,7 +130,7 @@ fn the_outgoing_accounts_oauth_is_parked_with_its_profile() {
     // the WRONG uuid here, and one that skips the capture writes no file.
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
 
     switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b").unwrap();
 
@@ -130,7 +139,7 @@ fn the_outgoing_accounts_oauth_is_parked_with_its_profile() {
         serde_json::from_str(&std::fs::read_to_string(&parked).unwrap()).unwrap();
     assert_eq!(
         got["account_uuid"],
-        serde_json::json!("account-a"),
+        serde_json::json!("a"),
         "the parked oauth must be the OUTGOING account's, not the incoming one's"
     );
 }
@@ -158,7 +167,7 @@ fn a_second_switch_into_a_previously_parked_account_restores_its_real_oauth_not_
     std::fs::write(
         dp.config_file(),
         serde_json::json!({
-            "lastKnownAccountUuid": "account-a",
+            "lastKnownAccountUuid": "a",
             "oauth:tokenCache": {"accessToken": "a-token"},
             "locale": "en-GB"
         })
@@ -199,7 +208,7 @@ fn a_second_switch_into_a_previously_parked_account_restores_its_real_oauth_not_
 fn parking_a_profile_records_it_against_the_account() {
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
     // An accounts.json holding the outgoing account must exist for the
     // record to land on.
     let mut accounts = byte::store::metadata::AccountsFile::default();
@@ -223,7 +232,7 @@ fn parking_a_profile_records_it_against_the_account() {
 fn switching_an_account_to_itself_changes_nothing() {
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
 
     let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "a").unwrap();
 
@@ -239,7 +248,7 @@ fn switching_an_account_to_itself_changes_nothing() {
         serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
     assert_eq!(
         cfg["lastKnownAccountUuid"],
-        serde_json::json!("account-a"),
+        serde_json::json!("a"),
         "self-switch must not clear the OAuth keys"
     );
     // No journal file should be created. The journal lives under HostPaths
@@ -253,7 +262,7 @@ fn switching_an_account_to_itself_changes_nothing() {
 fn a_self_switch_is_a_no_op_even_when_a_profile_is_already_stored() {
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
     // Pre-create a stored profile for account "a".
     let stored = tp.desktop_profile_dir("a").join("Network");
     std::fs::create_dir_all(&stored).unwrap();
@@ -276,7 +285,91 @@ fn a_self_switch_is_a_no_op_even_when_a_profile_is_already_stored() {
     // Config must be unchanged.
     let cfg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dp.config_file()).unwrap()).unwrap();
-    assert_eq!(cfg["lastKnownAccountUuid"], serde_json::json!("account-a"));
+    assert_eq!(cfg["lastKnownAccountUuid"], serde_json::json!("a"));
+}
+
+#[test]
+fn a_live_session_belonging_to_another_account_is_not_parked() {
+    // Review finding: the tray switches Claude Code without switching the
+    // desktop half at all, so the two can drift apart -- and `outgoing` is
+    // derived from sync-back, i.e. from whichever account Claude CODE was
+    // on. Concretely: the tray switches Code a -> b while Claude Desktop
+    // still holds a's session and `config.json` still names a; a later `byte
+    // switch c` from the CLI reports b as outgoing. Parking then writes a's
+    // token cache to `<store>/b/oauth.json` and moves a's profile
+    // directories under b's uuid, so a later `byte switch b` installs a's
+    // session and applies a's identity as b.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live(&dp, "a");
+    let live_config = std::fs::read_to_string(dp.config_file()).unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("b"), "c").unwrap();
+
+    assert_eq!(out, DesktopOutcome::IdentityMismatch);
+    assert!(
+        !tp.desktop_profile_dir("b").exists(),
+        "a's live session must not be filed under b's uuid -- not even its oauth.json"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dp.desktop_dir().join("Network/marker.txt")).unwrap(),
+        "account-a",
+        "nothing may move when the live session belongs to another account"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dp.config_file()).unwrap(),
+        live_config,
+        "the refusal must be byte-for-byte side-effect-free, config.json included"
+    );
+    assert!(
+        !tp.desktop_journal_file().exists(),
+        "no swap may have been planned, let alone started"
+    );
+}
+
+#[test]
+fn a_matching_live_session_is_still_parked_normally() {
+    // The guard must refuse only the desynchronised case: when the app's
+    // `lastKnownAccountUuid` IS the outgoing account, the ordinary park
+    // still happens.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    seed_live(&dp, "a");
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b").unwrap();
+
+    assert_eq!(out, DesktopOutcome::NoProfileForIncoming);
+    assert_eq!(
+        std::fs::read_to_string(tp.desktop_profile_dir("a").join("Network/marker.txt")).unwrap(),
+        "account-a"
+    );
+}
+
+#[test]
+fn an_absent_account_uuid_is_not_a_mismatch_and_still_parks() {
+    // A desktop app that has never been signed in (or was signed out) has no
+    // `lastKnownAccountUuid` at all. That is not a misfiling risk -- there is
+    // no session to file under the wrong account -- and refusing here would
+    // break the first switch on every fresh machine, so the park proceeds.
+    let tp = TestPaths::new().unwrap();
+    let dp = TestDesktopPaths::new().unwrap();
+    let dir = dp.desktop_dir().join("Network");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("marker.txt"), "signed-out").unwrap();
+    std::fs::write(
+        dp.config_file(),
+        serde_json::json!({"locale": "en-GB"}).to_string(),
+    )
+    .unwrap();
+
+    let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b").unwrap();
+
+    assert_eq!(out, DesktopOutcome::NoProfileForIncoming);
+    assert_eq!(
+        std::fs::read_to_string(tp.desktop_profile_dir("a").join("Network/marker.txt")).unwrap(),
+        "signed-out",
+        "an unidentified live profile is still parked, not stranded in the live directory"
+    );
 }
 
 /// A realistic unrepaired journal: one park that already completed, with the
@@ -317,7 +410,7 @@ fn an_unrepaired_journal_refuses_the_switch_without_touching_the_parked_oauth() 
     // files them as B's parked oauth, destroying b's genuine copy for good.
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
     seed_interrupted_journal(&tp, &dp.desktop_dir(), "a");
 
     // b's genuine parked identity, from the last switch that did complete.
@@ -354,7 +447,7 @@ fn the_journal_records_which_two_accounts_the_swap_is_between() {
     // first rename.
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
 
     // A stored profile for the incoming account, so `incoming` is Some.
     let stored_b = tp.desktop_profile_dir("b").join("Network");
@@ -400,7 +493,7 @@ fn a_committed_switch_survives_an_accounts_file_it_cannot_read() {
     // `AccountsSchemaMismatch`.
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
     std::fs::write(tp.accounts_file(), b"{ not json at all").unwrap();
 
     let out = switch_desktop(&tp, &dp, &FakeProbe::with_desktop(0, false), Some("a"), "b")
@@ -434,7 +527,7 @@ fn a_committed_switch_survives_an_accounts_file_it_cannot_read() {
 fn a_committed_switch_survives_an_accounts_file_it_cannot_write() {
     let tp = TestPaths::new().unwrap();
     let dp = TestDesktopPaths::new().unwrap();
-    seed_live(&dp, "account-a");
+    seed_live(&dp, "a");
 
     let mut accounts = byte::store::metadata::AccountsFile::default();
     accounts.upsert_from("a", &sample_snapshot("a"));

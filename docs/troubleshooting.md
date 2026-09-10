@@ -57,6 +57,20 @@ A few behaviors worth calling out even though they aren't errors:
     account has no captured desktop profile yet (it has never been the
     outgoing side of a switch while signed in to Claude Desktop). Sign in
     once and the next switch away from it captures one.
+  - **`Claude's desktop app is signed in as a different account than byte
+    expected, so its desktop session was left alone rather than filed under
+    the wrong account. Sign out in Claude, then run this switch again to
+    move it too.`** — `config.json`'s `lastKnownAccountUuid` names a
+    different account than the one byte was about to park the live session
+    under. The two halves have drifted apart: byte's tray switches Claude
+    Code without touching the desktop app at all, and you can sign into
+    Claude Desktop by hand at any time. Parking anyway would write this
+    account's cookies and OAuth keys into the *other* account's stored
+    profile, so a later switch into that account would restore the wrong
+    session and apply the wrong identity. Nothing on disk was changed — the
+    Claude Code switch itself still happened. A desktop app that is signed
+    out (no `lastKnownAccountUuid` at all) is not a mismatch and is parked
+    normally; there is no session there to misfile.
   - **`the Claude Code switch succeeded, but its desktop app session could
     not be switched: ...`** — the desktop half hit an error (for example, an
     unrepaired journal from an earlier interruption — see
@@ -71,18 +85,41 @@ A few behaviors worth calling out even though they aren't errors:
   appears; the desktop half is silently skipped rather than warning on every
   single switch about a directory that will never exist there.
 
-  **`byte switch --json` does not attempt the desktop half at all** in this
-  release — a script gets exactly the same `switch_json` payload it always
-  has, with no `desktop_profile`-style field and none of the four messages
-  above on stderr either. The Claude Code switch itself still happens
-  normally; only the desktop app's session is left untouched. Use a plain
-  `byte switch` (without `--json`) when you need the desktop app to follow.
+  **`byte switch --json` switches the desktop half too**, and answers in the
+  payload instead of on stderr: a `desktop` field carrying one lowercase
+  string — `"switched"`, `"app_running"`, `"no_profile_for_incoming"`,
+  `"identity_mismatch"` or `"nothing_to_do"` — one per case above, including
+  the self-switch case that prints nothing at all — plus `"failed"` when the
+  desktop half errored. The field is `null` when the
+  desktop half was not attempted at all: switching to the already-active
+  account, or a machine with no `%APPDATA%\Claude`. The key is always
+  present, so `null` is distinguishable from an older byte that never
+  emitted the field. None of the messages above are printed under `--json`,
+  with one exception: a failure's own text still goes to stderr, since the
+  field can only say `"failed"` and stdout is reserved for the payload. A
+  desktop failure never fails the command — `byte switch --json` still exits
+  zero with a valid JSON object on stdout.
 - **`repaired an interrupted desktop profile swap (RollForward)` /
   `(Reverse)`** on `byte list` or any other command is a confirmation, not an
   error: it means an earlier `byte switch` was interrupted mid-swap, and this
   command's automatic recovery (see `DesktopSwapInterrupted` above) just
   finished either completing the install (`RollForward`) or undoing the
-  parks (`Reverse`). Nothing further is needed.
+  parks (`Reverse`). Nothing further is needed. That recovery only runs when
+  the command can take byte's mutation lock: a journal is on disk for the
+  whole of every *healthy* swap too, so if another byte process is
+  mid-switch right now, that journal is its swap in flight and is left
+  strictly alone — silently, because a concurrent command is ordinary, not a
+  fault. Run the command again once the other one finishes if you were
+  expecting a repair.
+- **`byte could not take its mutation lock to check for an interrupted
+  desktop profile swap, so this command is continuing without checking:
+  ...`** is the third possibility for that same check: the lock file itself
+  (`mutation.lock` in byte's config directory) could not be opened or
+  locked — a permissions problem on that directory, most likely. It is a
+  warning, never a failure: a lock problem must not break an unrelated
+  command. Fix the permissions on byte's config directory (see
+  [Configuration](configuration.md)) and any pending repair happens on the
+  next command.
 - **`an earlier desktop profile swap could not be repaired automatically, so
   this command is continuing without touching it: ...`** is what every byte
   command prints instead of the confirmation above when automatic recovery

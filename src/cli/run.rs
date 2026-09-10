@@ -23,40 +23,12 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500)
 pub fn run(cli: Cli) -> Result<()> {
     let paths = RealPaths::discover()?;
 
-    // A half-completed desktop swap must be repaired by whatever byte
-    // command runs next, not only by a retry of the `switch` that was
-    // interrupted -- so this runs here, before the dispatch below (and
-    // before the tray-vs-CLI fork just past it), rather than being folded
-    // into `cmd_switch`. Safe to run unconditionally on every command and
-    // every platform: `desktop_journal_file` lives under byte's OWN config
-    // directory (via `HostPaths`, already resolved above), never under the
-    // desktop app's real `%APPDATA%\Claude` -- a machine that has never run
-    // a desktop swap has no such file, so this is a cheap `Ok(None)` the
-    // rest of the time.
-    //
-    // A recovery FAILURE (an unreadable journal, or one written by an
-    // incompatible format version) must not be allowed to propagate via
-    // `?` here: this runs before every command, including read-only ones
-    // that never touch the desktop machinery at all (`list`, `current`,
-    // `autostart`, even starting the tray with no arguments). Letting it
-    // fail `run()` would turn one corrupt file into total unavailability
-    // of the whole CLI, with no way to run byte again short of editing the
-    // journal by hand -- there is no weaker mode this reduces to. `switch`
-    // keeps its own, narrower protection regardless of what happens here:
-    // `switch_desktop`'s own precondition check still refuses to start a
-    // NEW swap over an unrepaired journal, and that refusal is reported
-    // the same "catch and warn" way by `report_desktop_outcome`, without
-    // failing the Claude Code switch that already committed.
-    match crate::desktop::swap::recover_if_interrupted(&paths) {
-        Ok(Some(recovery)) => output::warn(&format!(
-            "repaired an interrupted desktop profile swap ({recovery:?})."
-        )),
-        Ok(None) => {}
-        Err(e) => output::warn(&format!(
-            "an earlier desktop profile swap could not be repaired automatically, so this \
-             command is continuing without touching it: {e}"
-        )),
-    }
+    // Every command begins by repairing a desktop swap that an earlier run
+    // left half-finished -- but only while it can take the mutation lock,
+    // since an ungated repair would rename directories backwards underneath
+    // a swap another byte process is running right now. See
+    // `recover_under_lock`, which owns the whole rationale.
+    recover_under_lock(&paths);
 
     // No arguments starts the tray rather than listing accounts (see
     // `Cli::long_about`). Handled before `Switcher` even exists: `tray::run`
@@ -70,9 +42,11 @@ pub fn run(cli: Cli) -> Result<()> {
     let probe = SysinfoProbe::new();
 
     // Read-only commands (list, current, autostart) do not take the
-    // mutation lock: they tolerate a concurrent write because every file
-    // byte writes is replaced atomically, so there is never a torn read to
-    // guard against.
+    // mutation lock for themselves: they tolerate a concurrent write because
+    // every file byte writes is replaced atomically, so there is never a
+    // torn read to guard against. `recover_under_lock` above still takes it
+    // momentarily on their behalf -- that is about never WRITING over
+    // another process's in-flight swap, not about reading.
     match command {
         Command::List => cmd_list(&switcher, cli.json),
         Command::Current => cmd_current(&switcher, cli.json),
@@ -118,6 +92,81 @@ pub fn run(cli: Cli) -> Result<()> {
             let _guard = MutationGuard::acquire(&paths)?;
             cmd_rename(&switcher, &name, &label, cli.json)
         }
+    }
+}
+
+/// Repair a desktop swap left behind by a crash -- but only while this
+/// process can take the mutation lock.
+///
+/// A half-completed swap must be repaired by whatever byte command runs
+/// next, not only by a retry of the `switch` that was interrupted -- so this
+/// runs at the very start of `run`, before the dispatch (and before the
+/// tray-vs-CLI fork just past it), rather than being folded into
+/// `cmd_switch`. Safe to run on every command and every platform:
+/// `desktop_journal_file` lives under byte's OWN config directory (via
+/// `HostPaths`), never under the desktop app's real `%APPDATA%\Claude` -- a
+/// machine that has never run a desktop swap has no such file, so this is a
+/// cheap `Ok(None)` the rest of the time.
+///
+/// THE LOCK IS THE WHOLE POINT, so do not "simplify" it away: a journal is
+/// on disk for the whole of every HEALTHY swap, not only after a crash.
+/// `swap::execute` writes the complete journal before its first rename and
+/// clears it only after its last, so a `byte list` (or `current`, or
+/// `autostart`, none of which take the mutation lock for themselves) running
+/// during an ordinary `byte switch` would read that live journal, see no
+/// completed install, compute `Recovery::Reverse`, and rename the profile
+/// directories BACKWARDS while the switching process is still renaming them
+/// forwards -- then `clear_journal` the only record of a swap that is still
+/// in flight. That is precisely the state `swap::execute` and
+/// `switch_desktop` both document themselves as being protected from.
+///
+/// So each answer from `try_acquire` means something different:
+///
+/// - `Ok(Some(guard))` -- no other byte process is mutating, so any journal
+///   on disk really is wreckage. Repair it, then release the lock before
+///   returning: `run`'s own `Command::Switch`/`Capture`/... arms acquire it
+///   again for themselves, and a guard still held here would deadlock them
+///   against this process.
+/// - `Ok(None)` -- another byte process holds the lock, so it is mid-mutation
+///   and that journal is ITS in-flight swap. Skip silently: this is the
+///   ordinary concurrent case, not an error, and warning about it would
+///   report a fault on every perfectly healthy concurrent command.
+/// - `Err(e)` -- warn and continue, exactly as a recovery failure does
+///   below. A lock problem must not fail an unrelated command.
+///
+/// A recovery FAILURE (an unreadable journal, or one written by an
+/// incompatible format version) is caught here rather than propagated, for
+/// the same reason: this runs before every command, including read-only ones
+/// that never touch the desktop machinery at all. Letting it fail `run()`
+/// would turn one corrupt file into total unavailability of the whole CLI,
+/// with no way to run byte again short of editing the journal by hand --
+/// there is no weaker mode this reduces to. `switch` keeps its own, narrower
+/// protection regardless of what happens here: `switch_desktop`'s own
+/// precondition check still refuses to start a NEW swap over an unrepaired
+/// journal, and that refusal is reported the same "catch and warn" way by
+/// `report_desktop_outcome`, without failing the Claude Code switch that
+/// already committed.
+///
+/// `pub` (like `switch_json` and `resolve_add_failure`) specifically so the
+/// lock gate is directly testable against a `TestPaths` -- `run` itself
+/// resolves `RealPaths`, i.e. the developer's real config directory.
+pub fn recover_under_lock(paths: &impl HostPaths) {
+    match MutationGuard::try_acquire(paths) {
+        Ok(Some(_guard)) => match crate::desktop::swap::recover_if_interrupted(paths) {
+            Ok(Some(recovery)) => output::warn(&format!(
+                "repaired an interrupted desktop profile swap ({recovery:?})."
+            )),
+            Ok(None) => {}
+            Err(e) => output::warn(&format!(
+                "an earlier desktop profile swap could not be repaired automatically, so this \
+                 command is continuing without touching it: {e}"
+            )),
+        },
+        Ok(None) => {}
+        Err(e) => output::warn(&format!(
+            "byte could not take its mutation lock to check for an interrupted desktop profile \
+             swap, so this command is continuing without checking: {e}"
+        )),
     }
 }
 
@@ -248,13 +297,49 @@ fn report_sync(sync: &SyncOutcome) {
 /// sync-back just wrote a previously unknown account's refresh token to
 /// the keychain (finding M3) -- the non-JSON path already reports this via
 /// `report_sync`, but `--json` skipped it entirely.
-pub fn switch_json(outcome: &SwitchOutcome) -> serde_json::Value {
+///
+/// Includes `desktop` for the same reason: the desktop half runs under
+/// `--json` too, and a script driving it needs a machine-readable answer to
+/// "did Claude Desktop follow?" -- the human path's stderr messages are not
+/// one, and are not emitted under `--json` at all (except the failure
+/// warning, whose detail has nowhere else to go).
+pub fn switch_json(
+    outcome: &SwitchOutcome,
+    desktop: Option<&Result<DesktopOutcome>>,
+) -> serde_json::Value {
     serde_json::json!({
         "switched_to": outcome.switched_to.label,
         "uuid": outcome.switched_to.uuid,
         "already_active": outcome.already_active,
         "sync": sync_json(&outcome.sync),
+        "desktop": desktop_json(desktop),
     })
+}
+
+/// The `desktop` field: one lowercase name per `DesktopOutcome` variant.
+///
+/// `null` means the desktop half was not attempted at all -- an
+/// `already_active` no-op switch, or a platform where no `DesktopPaths`
+/// could be discovered. The key is always present, never omitted, for the
+/// same reason `listing_json` always carries `desktop_profile`: "not
+/// attempted" and "this build has never heard of the field" are different
+/// facts and a script must be able to tell them apart.
+///
+/// A failure is reported as the bare string `"failed"` rather than the
+/// error's own text: `Error`'s `Display` is written for humans and its
+/// wording is not a contract a script may match on. The detail still
+/// reaches the user, on stderr, via `desktop_failure_message`.
+fn desktop_json(outcome: Option<&Result<DesktopOutcome>>) -> serde_json::Value {
+    let name = match outcome {
+        None => return serde_json::Value::Null,
+        Some(Ok(DesktopOutcome::Switched)) => "switched",
+        Some(Ok(DesktopOutcome::AppRunning)) => "app_running",
+        Some(Ok(DesktopOutcome::NoProfileForIncoming)) => "no_profile_for_incoming",
+        Some(Ok(DesktopOutcome::IdentityMismatch)) => "identity_mismatch",
+        Some(Ok(DesktopOutcome::NothingToDo)) => "nothing_to_do",
+        Some(Err(_)) => "failed",
+    };
+    serde_json::Value::String(name.to_string())
 }
 
 fn sync_json(sync: &SyncOutcome) -> serde_json::Value {
@@ -312,55 +397,90 @@ pub fn cmd_switch<P: HostPaths + Copy, S: SecretStore, D: DesktopPaths>(
 ) -> Result<()> {
     let outcome = sw.switch_to(name)?;
 
-    // The desktop half is deliberately absent from --json entirely, rather
-    // than folded into this payload: `switch_json` is a stable, tested
-    // shape (`tests/cli_run_test.rs`), and the desktop outcome would need
-    // its own considered field and variants rather than being bolted on
-    // here. A script driving --json today gets exactly what it got before
-    // this task; a human running a plain `byte switch` gets the new
-    // stderr messages below.
+    // --json runs the desktop half too. It reports the result through the
+    // payload's `desktop` field instead of the human path's stderr messages
+    // below; skipping it entirely -- as this did before -- left a script
+    // driving `byte switch --json` with Claude Desktop still signed in as
+    // the previous account and nothing in its output saying so.
     if json {
-        output::data(&switch_json(&outcome).to_string());
+        let desktop_outcome = desktop_half(sw, probe, desktop, &outcome);
+
+        // The only prose --json emits, and it goes to stderr like every
+        // other message: stdout carries the payload alone. An error's detail
+        // has nowhere else to live -- the field can only say "failed".
+        if let Some(Err(e)) = &desktop_outcome {
+            output::warn(&desktop_failure_message(e));
+        }
+
+        output::data(&switch_json(&outcome, desktop_outcome.as_ref()).to_string());
         return Ok(());
     }
 
-    let SwitchOutcome {
-        switched_to,
-        sync,
-        already_active,
-    } = outcome;
-
-    report_sync(&sync);
-    if already_active {
-        output::info(&format!("{} is already active.", switched_to.label));
+    report_sync(&outcome.sync);
+    if outcome.already_active {
+        output::info(&format!("{} is already active.", outcome.switched_to.label));
     } else {
-        output::status(&format!("Switched to {}", switched_to.label));
+        output::status(&format!("Switched to {}", outcome.switched_to.label));
         if let Some(msg) = running_sessions_warning(probe.running_claude_sessions()) {
             output::warn(&msg);
         }
 
-        // Skipped for a no-op switch (the `already_active` branch above)
-        // and skipped outright when no desktop paths are available at all.
-        // `switch_desktop` also guards against a self-switch internally,
-        // but there is no reason for the CLI to even attempt it for an
-        // account that was already active.
-        if let Some(desktop) = desktop {
-            let outgoing = match &sync {
-                SyncOutcome::Updated(meta) | SyncOutcome::Captured(meta) => {
-                    Some(meta.uuid.as_str())
-                }
-                SyncOutcome::LoggedOut => None,
-            };
-            report_desktop_outcome(switch_desktop(
-                sw.paths(),
-                desktop,
-                probe,
-                outgoing,
-                &switched_to.uuid,
-            ));
+        // Deliberately here, after the status line above, rather than
+        // hoisted alongside the --json call: the desktop half moves
+        // directory trees, so running it first would leave the user staring
+        // at a silent terminal until it finished before learning that the
+        // Claude Code switch they asked for had already succeeded.
+        if let Some(result) = desktop_half(sw, probe, desktop, &outcome) {
+            report_desktop_outcome(&result);
         }
     }
     Ok(())
+}
+
+/// Run the desktop half of a switch, or `None` when it is not attempted.
+///
+/// Both output modes go through this, so `--json` and a plain `byte switch`
+/// can never disagree about whether the desktop app follows -- only about
+/// how the answer is reported.
+///
+/// Not attempted for a no-op switch (`already_active`), and not attempted at
+/// all when no desktop paths are available for this platform or environment
+/// (see `run`'s `Command::Switch` arm). `switch_desktop` also guards against
+/// a self-switch internally, but there is no reason for the CLI to even
+/// attempt it for an account that was already active.
+fn desktop_half<P: HostPaths + Copy, S: SecretStore, D: DesktopPaths>(
+    sw: &Switcher<P, S>,
+    probe: &impl ProcessProbe,
+    desktop: Option<&D>,
+    outcome: &SwitchOutcome,
+) -> Option<Result<DesktopOutcome>> {
+    if outcome.already_active {
+        return None;
+    }
+    let desktop = desktop?;
+
+    let outgoing = match &outcome.sync {
+        SyncOutcome::Updated(meta) | SyncOutcome::Captured(meta) => Some(meta.uuid.as_str()),
+        SyncOutcome::LoggedOut => None,
+    };
+    Some(switch_desktop(
+        sw.paths(),
+        desktop,
+        probe,
+        outgoing,
+        &outcome.switched_to.uuid,
+    ))
+}
+
+/// What the user is told when the desktop half fails outright.
+///
+/// Shared by both output modes: `--json` answers the "did it work" question
+/// in its payload, but the reason still has to reach the user somewhere, and
+/// stdout is reserved for the payload.
+fn desktop_failure_message(e: &Error) -> String {
+    format!(
+        "the Claude Code switch succeeded, but its desktop app session could not be switched: {e}"
+    )
 }
 
 /// Report the desktop half's outcome without ever turning it into a command
@@ -369,7 +489,7 @@ pub fn cmd_switch<P: HostPaths + Copy, S: SecretStore, D: DesktopPaths>(
 /// `ops::desktop`'s module doc comment) -- this follows the same "never
 /// fail an operation that already succeeded" rule `notify::send` and
 /// `atomic::prune` already apply elsewhere in this codebase.
-fn report_desktop_outcome(outcome: Result<DesktopOutcome>) {
+fn report_desktop_outcome(outcome: &Result<DesktopOutcome>) {
     match outcome {
         Ok(DesktopOutcome::Switched) => output::status("Claude desktop app switched too."),
         Ok(DesktopOutcome::AppRunning) => output::warn(
@@ -380,11 +500,13 @@ fn report_desktop_outcome(outcome: Result<DesktopOutcome>) {
             "No desktop session stored for this account yet, so Claude will open signed out. \
              Sign in there once and byte will remember it.",
         ),
+        Ok(DesktopOutcome::IdentityMismatch) => output::warn(
+            "Claude's desktop app is signed in as a different account than byte expected, so \
+             its desktop session was left alone rather than filed under the wrong account. \
+             Sign out in Claude, then run this switch again to move it too.",
+        ),
         Ok(DesktopOutcome::NothingToDo) => {}
-        Err(e) => output::warn(&format!(
-            "the Claude Code switch succeeded, but its desktop app session could not be \
-             switched: {e}"
-        )),
+        Err(e) => output::warn(&desktop_failure_message(e)),
     }
 }
 

@@ -25,8 +25,31 @@ pub enum DesktopOutcome {
     /// Outgoing profile parked, but the incoming account has none stored, so
     /// the app is now signed out and waiting for a login to capture.
     NoProfileForIncoming,
+    /// The live desktop session belongs to a different account than the one
+    /// byte was about to file it under; nothing was touched. See the guard
+    /// in [`switch_desktop`] for how the two halves drift apart.
+    IdentityMismatch,
     /// No outgoing account and nothing stored: there was nothing to move.
     NothingToDo,
+}
+
+/// Does the live desktop session belong to `expected`?
+///
+/// An ABSENT `lastKnownAccountUuid` is not a mismatch: there is no session
+/// to misfile, and parking a signed-out profile under the outgoing account
+/// is harmless -- that is the ordinary state of a desktop app the user has
+/// never signed into, and refusing there would break the first switch on
+/// every fresh machine. An explicit JSON `null` is read the same way, since
+/// it carries no identity either.
+///
+/// A value that is present but not a string cannot equal `expected` and so
+/// is a mismatch: byte would be about to file a session whose identity it
+/// cannot even read.
+fn identity_matches(live: &config::DesktopOauth, expected: &str) -> bool {
+    match live.account_uuid.as_ref() {
+        None | Some(serde_json::Value::Null) => true,
+        Some(v) => v.as_str() == Some(expected),
+    }
 }
 
 /// Total size of a directory tree, for the stored-profile record.
@@ -107,6 +130,35 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
     let live = desktop.desktop_dir();
     let park_to = outgoing.map(|uuid| paths.desktop_profile_dir(uuid));
     let install_from = paths.desktop_profile_dir(incoming);
+
+    // The outgoing account's OAuth keys are read BEFORE any rename runs.
+    // Order is load-bearing: once the swap starts, `config.json` is about to
+    // be overwritten with the incoming account's values, so capturing
+    // afterwards would read back the wrong account -- and a failure mid-swap
+    // would lose the outgoing account's identity entirely, leaving its
+    // parked cookies unusable. Read once, used twice: by the identity guard
+    // immediately below, and by the park that writes it out further down.
+    let outgoing_oauth = match outgoing {
+        Some(_) => Some(config::capture(&desktop.config_file())?),
+        None => None,
+    };
+
+    // Refuse to file one account's live session under another account's
+    // uuid. `outgoing` comes from the CLI's sync-back -- it names whichever
+    // account Claude CODE was on -- and the two halves can drift apart: the
+    // tray switches Claude Code without touching the desktop app at all, and
+    // a user can sign into Claude Desktop by hand at any time. When they
+    // have drifted, parking would write the live account's cookies into
+    // `<store>/<other-uuid>/` and its keys into that directory's
+    // `oauth.json`, so a later switch INTO that other account would install
+    // this account's session and apply its identity. Nothing on disk changes
+    // here: a refusal costs nothing and loses nothing.
+    if let (Some(uuid), Some(oauth)) = (outgoing, outgoing_oauth.as_ref())
+        && !identity_matches(oauth, uuid)
+    {
+        return Ok(DesktopOutcome::IdentityMismatch);
+    }
+
     // "Is there a stored profile?" is decided on whether the directory holds
     // anything that MOVES, not on the directory existing -- because this very
     // function creates that directory and writes `oauth.json` into it even
@@ -120,14 +172,9 @@ pub fn switch_desktop<P: HostPaths, D: DesktopPaths, R: ProcessProbe>(
     // anything has been committed, so refusing is still free here.
     let has_incoming = !profile::movable_entries(&install_from)?.is_empty();
 
-    // The outgoing account's OAuth keys are captured and written into its
-    // parked directory BEFORE any rename runs. Order is load-bearing: once
-    // the swap starts, `config.json` is about to be overwritten with the
-    // incoming account's values, so capturing afterwards would read back
-    // the wrong account -- and a failure mid-swap would lose the outgoing
-    // account's identity entirely, leaving its parked cookies unusable.
-    if let Some(park_to) = park_to.as_deref() {
-        let outgoing_oauth = config::capture(&desktop.config_file())?;
+    // The keys read above are written into the parked directory before the
+    // first rename, for the ordering reason given at that read.
+    if let (Some(park_to), Some(outgoing_oauth)) = (park_to.as_deref(), outgoing_oauth.as_ref()) {
         std::fs::create_dir_all(park_to).map_err(|source| Error::Io {
             path: park_to.to_path_buf(),
             source,
